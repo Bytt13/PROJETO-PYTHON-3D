@@ -3,64 +3,21 @@
  PARTE 4: PIPELINE DE RENDERIZAÇÃO (O MOTOR GRÁFICO)
 =============================================================================
 
- ╔══════════════════════════════════════════════════════════════════╗
- ║  OS 7 PASSOS DO PIPELINE (A LINHA DE MONTAGEM 3D→2D)            ║
- ╚══════════════════════════════════════════════════════════════════╝
+ Os 7 passos clássicos do pipeline de renderização software:
+   1. Transformação de Modelo  (Local → Mundo)
+   2. Transformação de Visão   (Mundo → Câmera)
+   3. Projeção                 (Câmera → Clip)
+   4. Recorte (Clipping)
+   5. Divisão por W            (Clip → NDC)
+   6. Mapeamento de Viewport   (NDC → Pixels)
+   7. Rasterização             (Bresenham para wireframe / Painter para sólido)
 
- ANALOGIA DA FÁBRICA:
- Imagine uma linha de montagem de carros. Cada estação faz UMA coisa
- específica antes de passar para a próxima. O resultado final é um carro
- pronto. Aqui, o "produto" são pixels na tela.
-
- PASSO 1 — Transformação de Modelo (Local → Mundo):
-   Cada objeto 3D existe em seu próprio espaço local.
-   Um cubo centrado em [0,0,0] é multiplicado pela Matriz de Modelo
-   para posicioná-lo, girar e escalar ele no mundo.
-
- PASSO 2 — Transformação de Visão (Mundo → Câmera):
-   A Matriz de Visão move o mundo inteiro para que a câmera
-   fique na origem olhando para -Z. Simplifica os próximos passos.
-
- PASSO 3 — Projeção (Câmera → Cubo Canônico):
-   A Matriz de Projeção deforma o frustum (cone de visão) em um
-   cubo perfeito de coordenadas -1 a +1 chamado NDC.
-   Objetos distantes são comprimidos; próximos, expandidos.
-
- PASSO 4 — Recorte (Clipping):
-   Descarta tudo que está fora do frustum (fora da tela).
-   ANALOGIA: é a tesoura que corta o que sai da foto.
-
- PASSO 5 — Divisão por W (Divisão de Perspectiva):
-   Divide x, y, z pelo componente w de cada vértice.
-   É aqui que a mágica da profundidade acontece:
-   objetos longe têm w grande → divididos → aparecem menores!
-
- PASSO 6 — Mapeamento de Viewport (NDC → Pixels):
-   Converte coordenadas -1/+1 para pixels reais da janela.
-   [-1,+1] → [0, largura] e [-1,+1] → [0, altura]
-
- PASSO 7 — Rasterização (Pixels!):
-   O algoritmo de Bresenham decide quais pixels colorir
-   para desenhar linhas e triângulos.
-
- ╔══════════════════════════════════════════════════════════════════╗
- ║  O ALGORITMO DE BRESENHAM (QUAL PIXEL PINTAR?)                  ║
- ╚══════════════════════════════════════════════════════════════════╝
-
- PROBLEMA: Uma linha entre (0,0) e (7,3) passa por infinitos pontos reais.
- Mas pixels são discretos! Temos que escolher os pixels "mais próximos".
-
- ANALOGIA DO FOTÓGRAFO:
- Imagine uma grade de xadrez. Você quer riscar uma linha diagonal com giz.
- O Bresenham é como um fotógrafo que decide: "este quadrado está MAIS perto
- da linha real? Então pinto ele."
-
- O TRUQUE: em vez de calcular raiz quadrada ou divisão (lento!),
- o Bresenham mantém um "erro acumulado" inteiro. Quando o erro ultrapassa
- o threshold, ele move para o próximo pixel na perpendicular.
- 
- Era revolucionário em 1962 — processadores lentos não podiam fazer
- operações de ponto flutuante. Bresenham usava só inteiros e deslocamentos!
+ RENDERIZAÇÃO SÓLIDA — ALGORITMO DO PINTOR + BLINN-PHONG:
+   1. Calcula a normal de cada face em espaço de mundo.
+   2. Aplica backface culling (descarta faces de costas para câmera).
+   3. Ordena faces de mais distante para mais próxima (algoritmo do pintor).
+   4. Pinta cada face com iluminação Blinn-Phong (ambient + diffuse + specular).
+   5. Desenha bordas escuras sobre as faces para definição.
 
 =============================================================================
 """
@@ -73,333 +30,225 @@ from typing import List, Tuple, Optional
 class Renderizador:
     """
     Motor de renderização 3D software (sem OpenGL).
-
-    Executa o pipeline completo: Modelo → Visão → Projeção →
-    Clipping → Divisão-W → Viewport → Rasterização.
+    Suporta modo wireframe (Bresenham) e modo sólido (Painter + Phong).
     """
 
     def __init__(self, superficie: pygame.Surface):
-        """
-        Inicializa o renderizador.
-
-        Args:
-            superficie: Surface do Pygame onde renderizar
-        """
         self.superficie = superficie
         self.largura = superficie.get_width()
         self.altura = superficie.get_height()
 
     # ════════════════════════════════════════════════════════════════════════
-    # PASSO 1-3: Transformações combinadas (Modelo, Visão, Projeção)
+    # Utilitários internos
     # ════════════════════════════════════════════════════════════════════════
 
-    def transformar_vertices(
+    def _clip_to_ndc_screen(self, v_clip: np.ndarray) -> Optional[Tuple[int,int]]:
+        """Converte um vértice clip-space para pixel. None se fora da câmera."""
+        w = v_clip[3]
+        if w <= 1e-6:
+            return None
+        nx = v_clip[0] / w
+        ny = v_clip[1] / w
+        px = int((nx + 1.0) * 0.5 * self.largura)
+        py = int((1.0 - ny) * 0.5 * self.altura)
+        return (px, py)
+
+    @staticmethod
+    def _face_normal(world_verts: np.ndarray, face: Tuple) -> np.ndarray:
+        """
+        Computa a normal de uma face poligonal em espaço de mundo.
+        Usa os três primeiros vértices (Newell method simplificado).
+        """
+        v0 = world_verts[face[0], :3]
+        v1 = world_verts[face[1], :3]
+        v2 = world_verts[face[2], :3]
+        n = np.cross(v1 - v0, v2 - v0)
+        length = np.linalg.norm(n)
+        return n / length if length > 1e-10 else np.zeros(3)
+
+    # ════════════════════════════════════════════════════════════════════════
+    # MODO SÓLIDO — Algoritmo do Pintor + Iluminação Blinn-Phong
+    # ════════════════════════════════════════════════════════════════════════
+
+    def renderizar_solido(
         self,
         vertices: np.ndarray,
-        matriz_modelo: np.ndarray,
+        faces: List[Tuple],
+        mat_modelo: np.ndarray,
         view_matrix: np.ndarray,
-        proj_matrix: np.ndarray
-    ) -> Tuple[np.ndarray, np.ndarray]:
+        proj_matrix: np.ndarray,
+        cor_base: Tuple[int, int, int],
+        camera_pos: np.ndarray,
+        luz_dir: np.ndarray = None,
+        bordas: bool = True,
+    ):
         """
-        Aplica o pipeline de transformação a todos os vértices.
+        Renderiza um sólido 3D com faces preenchidas e iluminação.
 
-        O pipeline MVP (Model-View-Projection) é a espinha dorsal
-        de qualquer motor gráfico. Cada vértice passa pelas 3 matrizes:
+        ILUMINAÇÃO BLINN-PHONG (flat shading por face):
+          I = Ka + Kd·max(0, N·L) + Ks·max(0, N·H)^shininess
 
-          v_clip = Proj × View × Model × v_local
+          Ka = componente ambiente   (luz mínima mesmo na sombra)
+          Kd = componente difusa     (Lambertiana — função do ângulo N·L)
+          Ks = componente especular  (brilho de superfície — N·H elevado a shininess)
+          N  = normal da face (espaço de mundo)
+          L  = direção da luz (normalizada)
+          H  = halfway vector = normalize(L + V)  [Blinn-Phong trick]
+          V  = direção da câmera ao centroide da face
 
-        Fazemos isso de uma vez ao multiplicar as matrizes primeiro
-        (MVP = Proj × View × Model) e depois aplicando a todos os vértices.
-        Muito mais eficiente se há muitos vértices!
-
-        Args:
-            vertices: array Nx3 de vértices locais do objeto
-            matriz_modelo: posição/rotação/escala no mundo
-            view_matrix: transforma para espaço da câmera
-            proj_matrix: aplica perspectiva
-
-        Returns:
-            (vertices_clip, vertices_ndc) — ambos em coordenadas homogêneas Nx4
+        ALGORITMO DO PINTOR:
+          Ordena faces do mais distante para o mais próximo em Z de view.
+          Desenha nessa ordem → faces próximas cobrem as distantes.
+          Simples e eficaz para objetos convexos.
         """
-        # Converte para coordenadas homogêneas: adiciona w=1
+        if luz_dir is None:
+            luz_dir = np.array([0.6, 1.0, -0.8], dtype=float)
+        luz = luz_dir / (np.linalg.norm(luz_dir) + 1e-10)
+
         n = len(vertices)
         verts_h = np.ones((n, 4), dtype=float)
         verts_h[:, :3] = vertices
 
-        # Matriz MVP combinada (Da direita para esquerda: Model → View → Proj)
-        mvp = proj_matrix @ view_matrix @ matriz_modelo
+        # Espaços de transformação
+        model_view = view_matrix @ mat_modelo
+        mvp = proj_matrix @ model_view
 
-        # Aplica MVP a todos os vértices de uma vez (transpõe para broadcast)
-        # Resultado: cada coluna = um vértice transformado
-        clip_coords = (mvp @ verts_h.T).T  # shape: (N, 4)
+        world_verts  = (mat_modelo   @ verts_h.T).T   # (N,4) — normais e backface
+        view_verts   = (model_view   @ verts_h.T).T   # (N,4) — depth sorting
+        clip_verts   = (mvp          @ verts_h.T).T   # (N,4) — tela
 
-        return clip_coords
+        model_center = mat_modelo[:3, 3]   # origem do objeto em espaço-mundo
 
-    # ════════════════════════════════════════════════════════════════════════
-    # PASSO 4: Clipping (Recorte no espaço do Frustum)
-    # ════════════════════════════════════════════════════════════════════════
+        drawable = []
 
-    def _dentro_frustum(self, v: np.ndarray) -> bool:
-        """
-        Verifica se um vértice está dentro do frustum (cubo NDC -1 a +1).
+        for face in faces:
+            # ── Coordenadas de tela ────────────────────────────────────────
+            screen_pts = []
+            any_behind = False
+            for idx in face:
+                pt = self._clip_to_ndc_screen(clip_verts[idx])
+                if pt is None:
+                    any_behind = True
+                    break
+                screen_pts.append(pt)
+            if any_behind or len(screen_pts) < 3:
+                continue
 
-        Para ser visível, todas as coordenadas clip devem satisfazer:
-          -w ≤ x ≤ w
-          -w ≤ y ≤ w
-          -w ≤ z ≤ w  (com w > 0)
+            # ── Normal em espaço-mundo ─────────────────────────────────────
+            normal = self._face_normal(world_verts, face)
+            if np.linalg.norm(normal) < 1e-10:
+                continue
 
-        ANALOGIA: É como checar se um ponto está dentro de uma caixa.
-        Fora = descarte (recorte); dentro = processa.
-        """
-        w = v[3]
-        if w <= 0:
-            return False  # Atrás da câmera
-        return (
-            -w <= v[0] <= w and
-            -w <= v[1] <= w and
-            -w <= v[2] <= w
-        )
+            # Garante que a normal aponta para FORA do sólido
+            centroid_w = np.mean(world_verts[[i for i in face], :3], axis=0)
+            if np.dot(normal, centroid_w - model_center) < 0:
+                normal = -normal
 
-    def recortar_aresta(
-        self,
-        v1_clip: np.ndarray,
-        v2_clip: np.ndarray
-    ) -> Optional[Tuple[np.ndarray, np.ndarray]]:
-        """
-        Recorte de uma aresta no frustum (Cohen-Sutherland simplificado).
+            # ── Backface Culling ───────────────────────────────────────────
+            # Se a normal aponta para o mesmo lado que o vetor câmera→face,
+            # estamos vendo o VERSO da face → descarta.
+            view_dir_to_face = centroid_w - camera_pos
+            if np.dot(normal, view_dir_to_face) >= 0:
+                continue
 
-        Se ambos os vértices estão fora do mesmo lado do frustum,
-        a aresta toda é descartada. Caso contrário, pelo menos
-        parte pode ser visível.
+            # ── Profundidade (Z em view space para ordenação) ──────────────
+            depth = float(np.mean([view_verts[i, 2] for i in face]))
 
-        Para este motor simplificado: se qualquer vértice está fora,
-        verificamos se a aresta cruza o plano near (z=-w, atrás da câmera).
+            # ── Iluminação Blinn-Phong ─────────────────────────────────────
+            # Componente difusa (Lambertiana)
+            diff = max(0.0, np.dot(normal, luz))
 
-        Returns:
-            (v1, v2) clipped ou None se a aresta é completamente invisível
-        """
-        dentro1 = self._dentro_frustum(v1_clip)
-        dentro2 = self._dentro_frustum(v2_clip)
+            # Componente especular (Blinn-Phong halfway vector)
+            v_dir = camera_pos - centroid_w
+            v_len = np.linalg.norm(v_dir)
+            if v_len > 1e-10:
+                v_dir = v_dir / v_len
+            H = luz + v_dir
+            H_len = np.linalg.norm(H)
+            H = H / H_len if H_len > 1e-10 else H
+            spec = max(0.0, np.dot(normal, H)) ** 64    # shininess = 64
 
-        if dentro1 and dentro2:
-            return v1_clip, v2_clip
+            # Combinação final
+            Ka = 0.18   # ambiente
+            Kd = 0.70   # difuso
+            Ks = 0.45   # especular
+            intensity = Ka + Kd * diff + Ks * spec
+            intensity = min(1.0, intensity)
 
-        if not dentro1 and not dentro2:
-            return None  # Totalmente fora
+            fill = (
+                min(255, int(cor_base[0] * intensity)),
+                min(255, int(cor_base[1] * intensity)),
+                min(255, int(cor_base[2] * intensity)),
+            )
+            drawable.append((depth, screen_pts, fill, normal))
 
-        # Um dentro, um fora: interpola para encontrar o ponto de cruzamento
-        # com o plano near (w + z = 0, ou seja, z = -w)
-        if not dentro1:
-            v1_clip, v2_clip = v2_clip, v1_clip  # Garante que v1 está dentro
+        # ── Algoritmo do Pintor: mais distante primeiro ────────────────────
+        # Em view space, z cresce negativamente na frente da câmera.
+        # Mais distante = Z menor (mais negativo) → order ASCENDING z.
+        drawable.sort(key=lambda x: x[0])
 
-        # Fator de interpolação para o plano near
-        w1, w2 = v1_clip[3], v2_clip[3]
-        z1, z2 = v1_clip[2], v2_clip[2]
-        denom = (w2 - w1) - (z2 - z1)
-        if abs(denom) < 1e-10:
-            return None
-
-        t = (w1 - z1) / denom
-        t = np.clip(t, 0, 1)
-        v_medio = v1_clip + t * (v2_clip - v1_clip)
-
-        return v1_clip, v_medio
-
-    # ════════════════════════════════════════════════════════════════════════
-    # PASSO 5: Divisão por W (Perspectiva Dividida)
-    # ════════════════════════════════════════════════════════════════════════
-
-    def divisao_perspectiva(self, v_clip: np.ndarray) -> Optional[np.ndarray]:
-        """
-        Divide x, y, z pelo componente w para obter coordenadas NDC.
-
-        NDC = Normalized Device Coordinates: valores de -1 a +1.
-
-        MAGIA DA PERSPECTIVA:
-        O componente w da projeção perspectiva é -z (distância da câmera).
-        Ao dividir por w, x e y são automaticamente diminuídos para
-        objetos distantes e aumentados para objetos próximos.
-        
-        É matematicamente equivalente à projeção perspectiva clássica:
-          x_tela = x_olho / (-z_olho) × distância_focal
-          
-        Args:
-            v_clip: vértice em coordenadas clip [x, y, z, w]
-
-        Returns:
-            coordenadas NDC [x_ndc, y_ndc, z_ndc] ou None se w≤0
-        """
-        w = v_clip[3]
-        if abs(w) < 1e-10:
-            return None
-
-        return np.array([
-            v_clip[0] / w,  # x_ndc: -1 (esquerda) a +1 (direita)
-            v_clip[1] / w,  # y_ndc: -1 (baixo) a +1 (cima)
-            v_clip[2] / w,  # z_ndc: -1 (perto) a +1 (longe) — depth
-        ])
+        # ── Rasterização ───────────────────────────────────────────────────
+        for depth, pts, fill, normal in drawable:
+            pygame.draw.polygon(self.superficie, fill, pts)
+            if bordas:
+                # Borda ligeiramente mais escura para definição de arestas
+                edge = (
+                    max(0, fill[0] - 55),
+                    max(0, fill[1] - 55),
+                    max(0, fill[2] - 55),
+                )
+                pygame.draw.polygon(self.superficie, edge, pts, 1)
 
     # ════════════════════════════════════════════════════════════════════════
-    # PASSO 6: Mapeamento de Viewport
+    # MODO WIREFRAME — Rasterização com Bresenham
     # ════════════════════════════════════════════════════════════════════════
 
-    def ndc_para_viewport(self, ndc: np.ndarray) -> Tuple[int, int]:
+    def bresenham_linha(self, x0:int, y0:int, x1:int, y1:int, cor:Tuple):
         """
-        Converte coordenadas NDC [-1, +1] para pixels da tela.
+        Algoritmo de Bresenham (1962): traça uma linha pixel a pixel
+        usando apenas adições de inteiros — sem divisão ou ponto flutuante.
 
-        ANALOGIA: é como esticar uma foto para caber em um moldura específica.
-
-        NDC x=-1 → pixel 0 (extrema esquerda)
-        NDC x=+1 → pixel largura (extrema direita)
-        NDC y=-1 → pixel altura (extremo BAIXO — Y invertido na tela!)
-        NDC y=+1 → pixel 0 (extremo TOPO)
-
-        O Y é invertido porque:
-        - Em matemática: y aumenta para CIMA
-        - Em telas: y aumenta para BAIXO (convenção das telas raster)
-
-        Args:
-            ndc: coordenadas NDC [x_ndc, y_ndc, ...]
-
-        Returns:
-            (px, py): coordenadas em pixels inteiros
+        Mantém um 'erro acumulado'. Quando ultrapassa o limiar,
+        avança no eixo secundário. Garante a linha mais próxima
+        da reta ideal entre dois pixels.
         """
-        # Mapeamento: NDC [-1,+1] → Pixel [0, largura/altura]
-        px = int((ndc[0] + 1.0) * 0.5 * self.largura)
-        py = int((1.0 - ndc[1]) * 0.5 * self.altura)  # Y invertido!
-        return (px, py)
-
-    # ════════════════════════════════════════════════════════════════════════
-    # PASSO 7: Rasterização com Bresenham
-    # ════════════════════════════════════════════════════════════════════════
-
-    def bresenham_linha(
-        self,
-        x0: int, y0: int,
-        x1: int, y1: int,
-        cor: Tuple[int, int, int]
-    ):
-        """
-        Algoritmo de Bresenham para desenhar uma linha entre dois pixels.
-
-        PROBLEMA: A linha matemática entre (x0,y0) e (x1,y1) é contínua.
-        Pixels são discretos. Como escolher quais colorir?
-
-        ANALOGIA DO ERRO ACUMULADO:
-        Imagine caminhar em diagonal numa grade de xadrez.
-        Você sempre quer ir para frente (eixo dominante).
-        O "erro" é o quanto você se desviou verticalmente da linha ideal.
-        Quando o erro ultrapassa 0.5 (meio pixel), você "sobe" um pixel.
-
-        REVOLUCIONÁRIO em 1962:
-        - Sem divisões! (só multiplicações por 2 e adições)
-        - Sem ponto flutuante! (só inteiros)
-        - Muito rápido para hardware da época.
-
-        ALGORITMO:
-          erro ← 0
-          para cada passo no eixo dominante:
-            pinta o pixel atual
-            erro += inclinação_normalizada
-            se erro ≥ 0.5:
-              avança no eixo secundário
-              erro -= 1
-        """
-        dx = abs(x1 - x0)
-        dy = abs(y1 - y0)
-        sx = 1 if x0 < x1 else -1  # direção em X
-        sy = 1 if y0 < y1 else -1  # direção em Y
-
-        # "Erro" inicial (multiplicado por 2 para evitar frações)
+        dx, dy = abs(x1 - x0), abs(y1 - y0)
+        sx = 1 if x0 < x1 else -1
+        sy = 1 if y0 < y1 else -1
         erro = dx - dy
-
-        # Limites da tela (evita desenhar fora)
         w, h = self.largura, self.altura
-
         while True:
-            # Pinta o pixel se estiver dentro da tela
             if 0 <= x0 < w and 0 <= y0 < h:
                 self.superficie.set_at((x0, y0), cor)
-
-            # Chegou ao destino?
             if x0 == x1 and y0 == y1:
                 break
-
-            e2 = 2 * erro  # erro × 2 (para eliminar o fator 0.5)
-
-            # Decide se avança em X
+            e2 = 2 * erro
             if e2 > -dy:
                 erro -= dy
                 x0 += sx
-
-            # Decide se avança em Y
             if e2 < dx:
                 erro += dx
                 y0 += sy
 
-    def desenhar_aresta(
-        self,
-        v1_clip: np.ndarray,
-        v2_clip: np.ndarray,
-        cor: Tuple[int, int, int]
-    ):
-        """
-        Pipeline completo para renderizar uma aresta (aresta do wireframe).
-
-        Executa: Clipping → Divisão-W → Viewport → Bresenham
-
-        Args:
-            v1_clip, v2_clip: vértices em coordenadas clip (após MVP)
-            cor: cor RGB da aresta
-        """
-        # Passo 4: Recorte
-        resultado = self.recortar_aresta(v1_clip, v2_clip)
-        if resultado is None:
-            return
-
-        v1c, v2c = resultado
-
-        # Passo 5: Divisão por W
-        ndc1 = self.divisao_perspectiva(v1c)
-        ndc2 = self.divisao_perspectiva(v2c)
-
-        if ndc1 is None or ndc2 is None:
-            return
-
-        # Passo 6: Mapeamento de Viewport
-        px1, py1 = self.ndc_para_viewport(ndc1)
-        px2, py2 = self.ndc_para_viewport(ndc2)
-
-        # Passo 7: Rasterização com Bresenham
-        self.bresenham_linha(px1, py1, px2, py2, cor)
-
-    def renderizar_objeto(
+    def renderizar_wireframe(
         self,
         vertices: np.ndarray,
-        arestas: List[Tuple[int, int]],
-        matriz_modelo: np.ndarray,
+        arestas: List[Tuple[int,int]],
+        mat_modelo: np.ndarray,
         view_matrix: np.ndarray,
         proj_matrix: np.ndarray,
-        cor: Tuple[int, int, int] = (255, 255, 255)
+        cor: Tuple = (255, 255, 255),
     ):
-        """
-        Renderiza um objeto 3D completo em wireframe.
+        """Renderiza um objeto em wireframe via Bresenham."""
+        n = len(vertices)
+        verts_h = np.ones((n, 4), dtype=float)
+        verts_h[:, :3] = vertices
+        mvp = proj_matrix @ view_matrix @ mat_modelo
+        clip = (mvp @ verts_h.T).T
 
-        Executa todos os 7 passos do pipeline para cada aresta do objeto.
-
-        Args:
-            vertices: coordenadas locais dos vértices (N×3)
-            arestas: pares de índices de vértices [(i,j), ...]
-            matriz_modelo: transformação do objeto no mundo
-            view_matrix: transformação da câmera
-            proj_matrix: transformação de projeção
-            cor: cor RGB do wireframe
-        """
-        # Passos 1-3: Transforma todos os vértices pelo MVP
-        clip_coords = self.transformar_vertices(
-            vertices, matriz_modelo, view_matrix, proj_matrix
-        )
-
-        # Para cada aresta, executa passos 4-7
         for i, j in arestas:
-            self.desenhar_aresta(clip_coords[i], clip_coords[j], cor)
+            v1, v2 = clip[i], clip[j]
+            p1 = self._clip_to_ndc_screen(v1)
+            p2 = self._clip_to_ndc_screen(v2)
+            if p1 and p2:
+                self.bresenham_linha(p1[0], p1[1], p2[0], p2[1], cor)

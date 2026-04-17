@@ -1,541 +1,633 @@
 """
 =============================================================================
- PARTE 5: APLICAÇÃO PRINCIPAL — VISUALIZADOR 3D INTERATIVO
+ PARTE 5: APLICAÇÃO PRINCIPAL — MENU + VISUALIZADOR 3D SÓLIDO
 =============================================================================
 
- Como executar:
-   python main.py
+ Controles no MENU:
+   ↑ / ↓      → navegar entre os sólidos
+   ENTER      → entrar no visualizador
 
- Controles:
-   W/S         → mover câmera frente/trás
-   A/D         → mover câmera esquerda/direita
-   Q/E         → mover câmera baixo/cima
-   ↑↓←→        → girar câmera (pitch/yaw)
-   Z/X         → zoom (diminuir/aumentar FOV)
-   R           → resetar câmera
-   ESPAÇO      → pausar/retomar animação
-   ESC         → sair
+ Controles no VISUALIZADOR:
+   W/S        → mover câmera frente/trás
+   A/D        → mover câmera esquerda/direita
+   Q/E        → mover câmera baixo/cima
+   ↑/↓/←/→   → girar câmera
+   Z/X        → zoom (ajustar FOV)
+   R          → resetar câmera
+   ESPAÇO     → pausar rotação automática
+   ESC        → voltar ao menu
 
 =============================================================================
 """
 
-import sys
-import math
+import sys, math, random
 import numpy as np
 import pygame
 
-from transforms import (
-    translacao, escala, rotacao_x, rotacao_y, rotacao_z,
-    cisalhamento_xy, compor
-)
-from quaternion import Quaternion, slerp
+from transforms import translacao, escala, rotacao_x, rotacao_y, rotacao_z, compor
+from quaternion import Quaternion, slerp as q_slerp
 from camera import Camera
 from renderer import Renderizador
+from mesh import FORMAS, Mesh
+
+# ════════════════════════════════════════════════════════════════════════════
+# CONSTANTES GLOBAIS
+# ════════════════════════════════════════════════════════════════════════════
+W, H = 1280, 720
+FPS  = 60
+
+# Paleta
+C_BG        = (  6,   6,  16)
+C_PANEL_DK  = ( 12,  12,  28)
+C_PANEL_MD  = ( 18,  18,  40)
+C_BORDER    = ( 35,  35,  75)
+C_BORDER_HL = (  0, 210, 240)   # ciano — highlight
+C_TEXT_DIM  = (100, 100, 140)
+C_TEXT      = (185, 185, 215)
+C_WHITE     = (240, 240, 255)
+C_ACCENT    = (  0, 210, 240)
+C_ACCENT2   = (170,  60, 255)
+
+# Direção da luz (world space)
+LUZ_DIR = np.array([0.6, 1.0, -0.8], dtype=float)
+LUZ_DIR = LUZ_DIR / np.linalg.norm(LUZ_DIR)
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# GEOMETRIAS 3D
+# UTILITÁRIOS DE UI
 # ════════════════════════════════════════════════════════════════════════════
 
-def criar_cubo(tamanho: float = 1.0):
-    """
-    Cria os vértices e arestas de um cubo centrado na origem.
+def lerp_color(a, b, t):
+    return tuple(int(a[i] + (b[i]-a[i])*t) for i in range(3))
 
-    ANATOMIA DO CUBO:
-    8 vértices nos cantos, 12 arestas (4 por face lateral, 4 topo, 4 baixo)
+def clamp(v, lo, hi):
+    return max(lo, min(hi, v))
 
-         7────6
-        /|   /|
-       4────5 |
-       | 3──|─2
-       |/   |/
-       0────1
+class FonteCache:
+    """Cache de fontes pygame para não recriar a cada frame."""
+    _cache = {}
+    @staticmethod
+    def get(nome, tamanho, bold=False):
+        key = (nome, tamanho, bold)
+        if key not in FonteCache._cache:
+            FonteCache._cache[key] = pygame.font.SysFont(nome, tamanho, bold=bold)
+        return FonteCache._cache[key]
 
-    Args:
-        tamanho: metade do lado do cubo (raio)
+def texto(surf, msg, x, y, cor=C_TEXT, nome="Consolas", tam=14, bold=False, centro=False):
+    f = FonteCache.get(nome, tam, bold)
+    s = f.render(str(msg), True, cor)
+    if centro:
+        x -= s.get_width() // 2
+    surf.blit(s, (x, y))
+    return s.get_width(), s.get_height()
 
-    Returns:
-        (vertices, arestas) com coordenadas no espaço local
-    """
-    s = tamanho
-    vertices = np.array([
-        [-s, -s, -s],  # 0: frente-baixo-esquerda
-        [ s, -s, -s],  # 1: frente-baixo-direita
-        [ s, -s,  s],  # 2: trás-baixo-direita
-        [-s, -s,  s],  # 3: trás-baixo-esquerda
-        [-s,  s, -s],  # 4: frente-cima-esquerda
-        [ s,  s, -s],  # 5: frente-cima-direita
-        [ s,  s,  s],  # 6: trás-cima-direita
-        [-s,  s,  s],  # 7: trás-cima-esquerda
-    ], dtype=float)
+def rect_aa(surf, cor, rx, ry, rw, rh, raio=8, borda=0, cor_borda=None):
+    """Desenha retângulo com cantos arredondados."""
+    pygame.draw.rect(surf, cor, (rx, ry, rw, rh), borda, border_radius=raio)
+    if borda and cor_borda:
+        pygame.draw.rect(surf, cor_borda, (rx, ry, rw, rh), borda, border_radius=raio)
 
-    arestas = [
-        # Base inferior
-        (0, 1), (1, 2), (2, 3), (3, 0),
-        # Base superior
-        (4, 5), (5, 6), (6, 7), (7, 4),
-        # Pilares verticais
-        (0, 4), (1, 5), (2, 6), (3, 7),
-    ]
-
-    return vertices, arestas
-
-
-def criar_piramide(base: float = 1.0, altura: float = 1.5):
-    """
-    Cria uma pirâmide de base quadrada.
-
-    ANATOMIA:
-    4 vértices na base + 1 vértice no topo = 5 vértices
-    8 arestas de aresta (4 base + 4 lados)
-
-         apex (4)
-        /|\\
-       / | \\
-      /  |  \\
-     0───1───2
-     └───3───┘
-     
-    Args:
-        base: metade do lado da base
-        altura: altura do apex acima da origem
-
-    Returns:
-        (vertices, arestas)
-    """
-    b = base
-    h = altura
-    vertices = np.array([
-        [-b, 0, -b],   # 0: base frente-esquerda
-        [ b, 0, -b],   # 1: base frente-direita
-        [ b, 0,  b],   # 2: base trás-direita
-        [-b, 0,  b],   # 3: base trás-esquerda
-        [ 0, h,  0],   # 4: apex (topo)
-    ], dtype=float)
-
-    arestas = [
-        # Base
-        (0, 1), (1, 2), (2, 3), (3, 0),
-        # Arestas laterais do apex
-        (0, 4), (1, 4), (2, 4), (3, 4),
-    ]
-
-    return vertices, arestas
-
-
-def criar_grid(tamanho: int = 6, passo: float = 1.0):
-    """
-    Cria um grid plano no plano XZ para referência visual.
-
-    ANALOGIA: é o "chão" do nosso mundo 3D.
-
-    Args:
-        tamanho: quantidade de linhas de cada lado do centro
-        passo: distância entre linhas
-
-    Returns:
-        (vertices, arestas)
-    """
-    vertices = []
-    arestas = []
-    v_idx = 0
-
-    for i in range(-tamanho, tamanho + 1):
-        # Linha paralela ao Z
-        vertices.append([i * passo, 0, -tamanho * passo])
-        vertices.append([i * passo, 0,  tamanho * passo])
-        arestas.append((v_idx, v_idx + 1))
-        v_idx += 2
-
-        # Linha paralela ao X
-        vertices.append([-tamanho * passo, 0, i * passo])
-        vertices.append([ tamanho * passo, 0, i * passo])
-        arestas.append((v_idx, v_idx + 1))
-        v_idx += 2
-
-    return np.array(vertices, dtype=float), arestas
-
-
-def criar_eixos(comprimento: float = 2.0):
-    """
-    Cria as setas dos eixos X (vermelho), Y (verde), Z (azul).
-    Retorna lista de (vertices, arestas, cor) para cada eixo.
-    """
-    eixos = [
-        (np.array([[0,0,0],[comprimento,0,0]], dtype=float), [(0,1)], (220, 60, 60)),    # X: vermelho
-        (np.array([[0,0,0],[0,comprimento,0]], dtype=float), [(0,1)], (60, 220, 60)),    # Y: verde
-        (np.array([[0,0,0],[0,0,comprimento]], dtype=float), [(0,1)], (60, 60, 220)),    # Z: azul
-    ]
-    return eixos
+def glow_line(surf, cor, p1, p2, largura=2):
+    """Linha com 'glow' (camadas sobrepostas)."""
+    pygame.draw.line(surf, tuple(c//4 for c in cor), p1, p2, largura+4)
+    pygame.draw.line(surf, tuple(c//2 for c in cor), p1, p2, largura+2)
+    pygame.draw.line(surf, cor, p1, p2, largura)
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# PALETA DE CORES
+# SISTEMA DE PARTÍCULAS (fundo animado)
 # ════════════════════════════════════════════════════════════════════════════
 
-PRETO           = (  8,   8,  18)
-BRANCO          = (255, 255, 255)
-CIANO           = ( 0,  220, 255)
-LARANJA         = (255, 140,   0)
-VIOLETA         = (180,  80, 255)
-VERDE_NEON      = (  0, 255, 140)
-AMARELO         = (255, 230,  60)
-CINZA_GRADE     = ( 45,  45,  65)
-CINZA_TEXTO     = (180, 180, 210)
-AZUL_ESCURO     = ( 10,  10,  35)
-VERMELHO_GLOW   = (255,  60,  60)
+class Particle:
+    def __init__(self, w, h):
+        self.reset(w, h, aleatorio=True)
+
+    def reset(self, w, h, aleatorio=False):
+        self.x = random.uniform(0, w)
+        self.y = random.uniform(0, h) if aleatorio else -5
+        self.r = random.uniform(0.5, 2.0)
+        self.vy = random.uniform(12, 40)
+        self.vx = random.uniform(-8, 8)
+        self.alpha = random.uniform(40, 120)
+        self.cor = random.choice([
+            (0, 150, 220), (130, 60, 220), (0, 200, 130), (200, 200, 255)
+        ])
+
+    def update(self, dt, w, h):
+        self.x += self.vx * dt
+        self.y += self.vy * dt
+        if self.y > h + 10 or self.x < -10 or self.x > w + 10:
+            self.reset(w, h)
+
+    def draw(self, surf):
+        ix, iy, ir = int(self.x), int(self.y), max(1, int(self.r))
+        pygame.draw.circle(surf, self.cor, (ix, iy), ir)
+
+
+def criar_particulas(n=70):
+    return [Particle(W, H) for _ in range(n)]
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# UTILITÁRIOS DE HUD (Interface Heads-Up Display)
+# TELA DE MENU
 # ════════════════════════════════════════════════════════════════════════════
 
-class HUD:
-    """Gerencia o display de texto na tela (overlay 2D)."""
+class Menu:
+    CARD_H   = 62
+    CARD_GAP = 8
+    LIST_X   = 60
+    LIST_W   = 370
+    DESC_X   = 480
+    DESC_W   = W - 480 - 50
 
-    def __init__(self, superficie: pygame.Surface):
-        self.sup = superficie
-        self.w = superficie.get_width()
-        self.h = superficie.get_height()
+    def __init__(self, surf: pygame.Surface, particulas, larg=W, alt=H):
+        self.surf       = surf
+        self.particulas = particulas
+        self.selecionado = 0
+        self.n = len(FORMAS)
+        self.larg = larg
+        self.alt  = alt
+        self._scroll_anim = 0.0
+        self._pulse = 0.0
 
-        # Fontes
-        pygame.font.init()
-        self.fonte_titulo = pygame.font.SysFont("Consolas", 15, bold=True)
-        self.fonte_info   = pygame.font.SysFont("Consolas", 13)
-        self.fonte_small  = pygame.font.SysFont("Consolas", 11)
+    def _card_y(self, idx):
+        """Y do card para o índice idx."""
+        top = self.alt // 2 - (self.n / 2) * (self.CARD_H + self.CARD_GAP)
+        return int(top + idx * (self.CARD_H + self.CARD_GAP))
 
-    def _texto(self, texto: str, x: int, y: int, cor=CINZA_TEXTO, fonte=None):
-        if fonte is None:
-            fonte = self.fonte_info
-        surf = fonte.render(texto, True, cor)
-        self.sup.blit(surf, (x, y))
+    def handle_event(self, ev):
+        """Retorna 'viewer' se ENTER, None caso contrário."""
+        if ev.type == pygame.KEYDOWN:
+            if ev.key in (pygame.K_DOWN, pygame.K_s):
+                self.selecionado = (self.selecionado + 1) % self.n
+            elif ev.key in (pygame.K_UP, pygame.K_w):
+                self.selecionado = (self.selecionado - 1) % self.n
+            elif ev.key in (pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_SPACE):
+                return "viewer"
+        if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
+            mx, my = ev.pos
+            for i in range(self.n):
+                cy = self._card_y(i)
+                if self.LIST_X <= mx <= self.LIST_X + self.LIST_W and cy <= my <= cy + self.CARD_H:
+                    if self.selecionado == i:
+                        return "viewer"
+                    self.selecionado = i
+        return None
 
-    def desenhar(self, camera: Camera, fps: float, pausado: bool, t_slerp: float):
-        """Desenha o painel de informações."""
-        # ── Painel superior esquerdo ──────────────────────────────────────
-        painel_x, painel_y = 12, 12
-        linhas = [
-            ("▶ VISUALIZADOR 3D", CIANO, self.fonte_titulo),
-            (f"  FPS: {fps:5.1f}", VERDE_NEON, self.fonte_info),
-            (f"  FOV: {camera.fov:5.1f}°", AMARELO, self.fonte_info),
-            (f"  Câm: ({camera.posicao[0]:+.2f}, {camera.posicao[1]:+.2f}, {camera.posicao[2]:+.2f})", CINZA_TEXTO, self.fonte_info),
-            (f"  Yaw: {math.degrees(camera.yaw):+.1f}°  Pitch: {math.degrees(camera.pitch):+.1f}°", CINZA_TEXTO, self.fonte_info),
-        ]
-        if pausado:
-            linhas.append(("  ⏸ PAUSADO", LARANJA, self.fonte_titulo))
+    def update(self, dt):
+        self._pulse = (self._pulse + dt * 2.0) % (2 * math.pi)
 
-        y_atual = painel_y
-        for texto, cor, fonte in linhas:
-            self._texto(texto, painel_x, y_atual, cor, fonte)
-            y_atual += fonte.get_height() + 3
+    def draw(self, larg=W, alt=H):
+        self.larg, self.alt = larg, alt
+        surf = self.surf
+        surf.fill(C_BG)
 
-        # ── Barra SLERP ───────────────────────────────────────────────────
-        barra_x, barra_y = 12, self.h - 65
-        self._texto("SLERP — Transição Suave entre Rotações:", barra_x, barra_y, CINZA_TEXTO, self.fonte_small)
-        barra_largura = 220
-        barra_altura = 10
-        pygame.draw.rect(self.sup, (40, 40, 60), (barra_x, barra_y + 15, barra_largura, barra_altura), border_radius=5)
-        fill_w = int(t_slerp * barra_largura)
+        # ── Fundo gradiente sutil ────────────────────────────────────────────
+        for i in range(0, alt, 3):
+            t = i / alt
+            r = int(6 + 12*t); g = int(6 + 6*t); b = int(16 + 24*t)
+            pygame.draw.line(surf, (r,g,b), (0,i), (larg,i))
+            pygame.draw.line(surf, (r,g,b), (0,i+1), (larg,i+1))
+            pygame.draw.line(surf, (r,g,b), (0,i+2), (larg,i+2))
+
+        # ── Partículas ─────────────────────────────────────────────────────
+        for p in self.particulas:
+            p.draw(surf)
+
+        # ── Título ─────────────────────────────────────────────────────────────────
+        pulse = (math.sin(self._pulse) + 1) / 2
+        cor_titulo = lerp_color(C_ACCENT, C_ACCENT2, pulse)
+        texto(surf, "VISUALIZADOR 3D", larg//2, 28, cor_titulo, "Consolas", 40, bold=True, centro=True)
+        texto(surf, "Computação Gráfica — Sólidos Geométricos",
+              larg//2, 80, C_TEXT_DIM, "Consolas", 15, centro=True)
+        glow_line(surf, C_ACCENT, (larg//4, 105), (3*larg//4, 105), 1)
+
+        # ── Lista de sólidos (esquerda) ────────────────────────────────────
+        for i, forma in enumerate(FORMAS):
+            cy = self._card_y(i)
+            selecionado = (i == self.selecionado)
+
+            # Fundo do card
+            card_cor = C_PANEL_MD if selecionado else C_PANEL_DK
+            rect_aa(surf, card_cor, self.LIST_X, cy, self.LIST_W, self.CARD_H, raio=10)
+
+            # Borda
+            borda_cor = cor_titulo if selecionado else C_BORDER
+            borda_w = 2 if selecionado else 1
+            rect_aa(surf, (0,0,0,0), self.LIST_X, cy, self.LIST_W, self.CARD_H,
+                    raio=10, borda=borda_w, cor_borda=borda_cor)
+
+            # Cor lateral (indicador)
+            if selecionado:
+                pygame.draw.rect(surf, forma.cor,
+                                 (self.LIST_X, cy+10, 4, self.CARD_H-20), border_radius=2)
+
+            # Número + Ícone + Nome
+            num_cor  = forma.cor if selecionado else C_TEXT_DIM
+            nome_cor = C_WHITE   if selecionado else C_TEXT
+
+            texto(surf, f"{i+1:02d}", self.LIST_X + 16, cy + 10, num_cor, "Consolas", 12)
+            texto(surf, forma.nome, self.LIST_X + 50, cy + 12,
+                  nome_cor, "Consolas", 17, bold=selecionado)
+
+            # Propriedades em miniatura
+            props = forma.propriedades
+            mini = f"V:{props.get('Vértices','?')}  F:{props.get('Faces','?')}  A:{props.get('Arestas','?')}"
+            texto(surf, mini, self.LIST_X + 50, cy + 36, C_TEXT_DIM, "Consolas", 11)
+
+            # Seta indicadora
+            if selecionado:
+                texto(surf, "▶", self.LIST_X + self.LIST_W - 28, cy + 21,
+                      cor_titulo, "Consolas", 16)
+
+        # ── Painel de descrição (direita) ──────────────────────────────────────────
+        forma = FORMAS[self.selecionado]
+        dx, dy = self.DESC_X, 120
+        dw = larg - self.DESC_X - 50
+        dh = alt - 180
+
+        rect_aa(surf, C_PANEL_DK, dx, dy-10, dw, dh, raio=14)
+        rect_aa(surf, (0,0,0,0), dx, dy-10, dw, dh, raio=14, borda=1, cor_borda=C_BORDER)
+
+        # Patch colorido no topo do painel
+        pygame.draw.rect(surf, forma.cor,
+                         (dx, dy-10, dw, 5), border_radius=14)
+
+        # Nome grande
+        texto(surf, forma.nome, dx + dw//2, dy + 10,
+              forma.cor, "Consolas", 30, bold=True, centro=True)
+
+        # Badge tipo
+        tipo = forma.propriedades.get("Tipo", "")
+        tw, _ = texto(surf, tipo, dx + dw//2, dy + 52,
+                      C_TEXT_DIM, "Consolas", 13, centro=True)
+        rect_aa(surf, C_PANEL_MD, dx + dw//2 - tw//2 - 10, dy + 48,
+                tw + 20, 20, raio=10)
+        texto(surf, tipo, dx + dw//2, dy + 52,
+              C_TEXT_DIM, "Consolas", 13, centro=True)
+
+        # Linha
+        pygame.draw.line(surf, C_BORDER,
+                         (dx+20, dy+78), (dx+dw-20, dy+78))
+
+        # Propriedades em tabela
+        ry = dy + 92
+        for k, v in forma.propriedades.items():
+            if k == "Tipo":
+                continue
+            texto(surf, k, dx + 30, ry, C_TEXT_DIM, "Consolas", 13)
+            texto(surf, str(v), dx + dw - 30, ry, C_WHITE, "Consolas", 13,
+                  centro=False)
+            # Alinha valor à direita
+            fw, _ = texto(surf, str(v), dx, ry, C_WHITE, "Consolas", 13)
+            surf.fill((0,0,0,0), (dx, ry, fw, 18))  # apaga
+            texto(surf, str(v), dx + dw - 30 - fw, ry, C_WHITE, "Consolas", 13)
+            ry += 22
+
+        pygame.draw.line(surf, C_BORDER,
+                         (dx+20, ry+4), (dx+dw-20, ry+4))
+
+        # Descrição (multi-linha)
+        ry += 16
+        for linha in forma.descricao.split("\n"):
+            texto(surf, linha, dx + 30, ry, C_TEXT, "Consolas", 13)
+            ry += 20
+
+        # Botão ENTER
+        btn_y = dy + dh - 52
+        pulse2 = (math.sin(self._pulse * 1.5) + 1) / 2
+        btn_cor = lerp_color(C_PANEL_MD, forma.cor, pulse2 * 0.3)
+        rect_aa(surf, btn_cor, dx + 40, btn_y, dw - 80, 36, raio=10)
+        rect_aa(surf, (0,0,0), dx + 40, btn_y, dw - 80, 36,
+                raio=10, borda=2, cor_borda=lerp_color(C_BORDER, forma.cor, pulse2))
+        texto(surf, "▷  ENTER   para visualizar",
+              dx + dw//2, btn_y + 9, C_WHITE, "Consolas", 15, bold=True, centro=True)
+
+        # ── Rodápé ─────────────────────────────────────────────────────────────────
+        pygame.draw.line(surf, C_BORDER, (0, alt-36), (larg, alt-36))
+        texto(surf, "↑↓  Navegar    ENTER  Visualizar    ESC  Sair",
+              larg//2, alt-26, C_TEXT_DIM, "Consolas", 12, centro=True)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# TELA DO VISUALIZADOR 3D
+# ════════════════════════════════════════════════════════════════════════════
+
+class Visualizador:
+    def __init__(self, surf: pygame.Surface, forma: Mesh, larg=W, alt=H):
+        self.surf    = surf
+        self.forma   = forma
+        self.larg    = larg
+        self.alt     = alt
+        self.renderer = Renderizador(surf)
+        self.renderer.largura = larg
+        self.renderer.altura  = alt
+
+        dist = max(3.5, float(np.max(np.abs(forma.vertices))) * 3.2)
+        self.camera = Camera(
+            posicao=np.array([0.0, 1.8, dist]),
+            fov=55.0,
+            aspect_ratio=larg/alt,
+        )
+        self.camera.yaw   = -math.pi / 2
+        self.camera.pitch = -0.22
+
+        # Quaterniões para rotação automática
+        self._q_rot  = Quaternion(1, 0, 0, 0)
+        self._q_spin = Quaternion.from_axis_angle([0,1,0], 0.009)
+
+        # SLERP demo
+        self._q_A     = Quaternion.from_axis_angle([1,0,0], 0)
+        self._q_B     = Quaternion.from_axis_angle([0,1,1], math.pi * 0.9)
+        self._t_slerp = 0.0
+        self._sdir    = 1
+
+        self._pausado = False
+        self._tempo   = 0.0
+        self._mouse_drag = False
+        self._ultimo_mouse = (0, 0)
+
+    def handle_event(self, ev):
+        """Retorna 'menu' se ESC, None caso contrário."""
+        if ev.type == pygame.KEYDOWN:
+            if ev.key == pygame.K_ESCAPE:
+                return "menu"
+            if ev.key == pygame.K_SPACE:
+                self._pausado = not self._pausado
+            if ev.key == pygame.K_r:
+                dist = max(3.5, float(np.max(np.abs(self.forma.vertices))) * 3.2)
+                self.camera.posicao = np.array([0.0, 1.8, dist])
+                self.camera.yaw   = -math.pi / 2
+                self.camera.pitch = -0.22
+                self.camera.fov   = 55.0
+
+        if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
+            self._mouse_drag = True
+            self._ultimo_mouse = ev.pos
+        if ev.type == pygame.MOUSEBUTTONUP and ev.button == 1:
+            self._mouse_drag = False
+        if ev.type == pygame.MOUSEMOTION and self._mouse_drag:
+            dx = ev.pos[0] - self._ultimo_mouse[0]
+            dy = ev.pos[1] - self._ultimo_mouse[1]
+            self.camera.rotacionar(dx * 0.005, -dy * 0.005)
+            self._ultimo_mouse = ev.pos
+        return None
+
+    def update(self, dt):
+        if not self._pausado:
+            self._tempo   += dt
+            # Rotação automática do sólido via produto de quatérnios
+            self._q_rot    = self._q_spin * self._q_rot
+
+            # Oscila t_slerp para demonstrar transição suave
+            self._t_slerp += self._sdir * dt * 0.35
+            if self._t_slerp >= 1.0:
+                self._t_slerp = 1.0
+                self._sdir = -1
+            elif self._t_slerp <= 0.0:
+                self._t_slerp = 0.0
+                self._sdir = 1
+
+        # Input contínuo de câmera
+        teclas = pygame.key.get_pressed()
+        vel = 4.0 * dt
+        if teclas[pygame.K_w]:      self.camera.mover_frente(vel)
+        if teclas[pygame.K_s]:      self.camera.mover_tras(vel)
+        if teclas[pygame.K_a]:      self.camera.mover_esquerda(vel)
+        if teclas[pygame.K_d]:      self.camera.mover_direita(vel)
+        if teclas[pygame.K_q]:      self.camera.mover_baixo(vel)
+        if teclas[pygame.K_e]:      self.camera.mover_cima(vel)
+        rv = 1.8 * dt
+        if teclas[pygame.K_LEFT]:   self.camera.rotacionar(-rv, 0)
+        if teclas[pygame.K_RIGHT]:  self.camera.rotacionar( rv, 0)
+        if teclas[pygame.K_UP]:     self.camera.rotacionar(0,  rv)
+        if teclas[pygame.K_DOWN]:   self.camera.rotacionar(0, -rv)
+        if teclas[pygame.K_z]:      self.camera.zoom(-28*dt)
+        if teclas[pygame.K_x]:      self.camera.zoom( 28*dt)
+
+    def draw(self, fps: float):
+        surf = self.surf
+        forma = self.forma
+
+        # ── Fundo ──────────────────────────────────────────────────────────
+        surf.fill(C_BG)
+        for i in range(0, self.alt, 4):
+            t = i / self.alt
+            r = int(6  + 10*t); g = int(6  +  5*t); b = int(16 + 20*t)
+            pygame.draw.line(surf, (r,g,b), (0,i),   (self.larg,i))
+            pygame.draw.line(surf, (r,g,b), (0,i+1), (self.larg,i+1))
+            pygame.draw.line(surf, (r,g,b), (0,i+2), (self.larg,i+2))
+            pygame.draw.line(surf, (r,g,b), (0,i+3), (self.larg,i+3))
+
+        # ── Matriz de modelo: aplica rotação do quatérnio ──────────────────
+        # Combina rotação automática com toque do SLERP
+        q_slerp_atual = q_slerp(self._q_A, self._q_B, self._t_slerp)
+        q_total = self._q_rot * q_slerp_atual
+        mat_rot = q_total.to_matrix()
+
+        # Escala para que objetos muito grandes ou pequenos caibam bem
+        escala_auto = 1.3 / max(0.01, float(np.max(np.abs(forma.vertices))))
+        mat_modelo = compor(mat_rot, escala(escala_auto, escala_auto, escala_auto))
+
+        view = self.camera.get_view_matrix()
+        proj = self.camera.get_projection_matrix()
+
+        # ── Grid de chão ───────────────────────────────────────────────────
+        self._desenhar_grid(view, proj)
+
+        # ── Sólido ─────────────────────────────────────────────────────────
+        self.renderer.superficie = surf
+        self.renderer.largura    = self.larg
+        self.renderer.altura     = self.alt
+        self.renderer.renderizar_solido(
+            forma.vertices,
+            forma.faces,
+            mat_modelo,
+            view,
+            proj,
+            cor_base=forma.cor,
+            camera_pos=self.camera.posicao,
+            luz_dir=LUZ_DIR,
+            bordas=True,
+        )
+
+        # ── HUD ────────────────────────────────────────────────────────────
+        self._draw_hud(fps)
+
+    def _desenhar_grid(self, view, proj):
+        """Grid XZ simples como chão de referência."""
+        mat_id = np.eye(4, dtype=float)
+        ren = self.renderer
+        T = 5
+        cor_g = (28, 28, 55)
+        for i in range(-T, T+1):
+            # linha paralela ao Z
+            verts = np.array([[i,0,-T],[i,0,T]], dtype=float)
+            ren.renderizar_wireframe(verts,[(0,1)],mat_id,view,proj,cor=cor_g)
+            # linha paralela ao X
+            verts = np.array([[-T,0,i],[T,0,i]], dtype=float)
+            ren.renderizar_wireframe(verts,[(0,1)],mat_id,view,proj,cor=cor_g)
+
+    def _draw_hud(self, fps: float):
+        surf = self.surf
+        forma = self.forma
+        cam   = self.camera
+
+        # ── Painel esquerdo ─────────────────────────────────────────────────
+        rect_aa(surf, C_PANEL_DK, 10, 10, 280, 135, raio=12)
+        rect_aa(surf, (0,0,0,0),  10, 10, 280, 135, raio=12, borda=1, cor_borda=C_BORDER)
+        pygame.draw.rect(surf, forma.cor, (10, 10, 280, 4), border_radius=12)
+
+        texto(surf, forma.nome, 22, 22, forma.cor, "Consolas", 18, bold=True)
+
+        props = forma.propriedades
+        py = 52
+        for k in ("Vértices","Faces","Arestas","Tipo"):
+            v = props.get(k,"—")
+            texto(surf, f"{k}:", 22, py, C_TEXT_DIM, "Consolas", 12)
+            texto(surf, str(v), 120, py, C_WHITE,    "Consolas", 12)
+            py += 18
+
+        # FPS
+        texto(surf, f"FPS: {fps:5.1f}", 22, py+2, C_ACCENT, "Consolas", 13, bold=True)
+
+        # ── Painel SLERP ───────────────────────────────────────────────────
+        rect_aa(surf, C_PANEL_DK, 10, H-64, 265, 52, raio=10)
+        rect_aa(surf, (0,0,0,0),  10, H-64, 265, 52, raio=10, borda=1, cor_borda=C_BORDER)
+        texto(surf, "SLERP  (interpolação de rotação)",
+              18, H-58, C_TEXT_DIM, "Consolas", 11)
+
+        bw = 230
+        pygame.draw.rect(surf, (30,30,60), (18, H-42, bw, 10), border_radius=5)
+        fill_w = int(self._t_slerp * bw)
         if fill_w > 0:
-            pygame.draw.rect(self.sup, VIOLETA, (barra_x, barra_y + 15, fill_w, barra_altura), border_radius=5)
-        pygame.draw.rect(self.sup, CINZA_GRADE, (barra_x, barra_y + 15, barra_largura, barra_altura), 1, border_radius=5)
-        self._texto(f"t = {t_slerp:.2f}", barra_x + barra_largura + 8, barra_y + 14, VIOLETA, self.fonte_small)
+            pygame.draw.rect(surf, C_ACCENT2, (18, H-42, fill_w, 10), border_radius=5)
+        pygame.draw.rect(surf, C_BORDER,    (18, H-42, bw, 10), 1, border_radius=5)
+        texto(surf, f"t={self._t_slerp:.2f}", 258, H-44, C_ACCENT2, "Consolas", 11)
 
-        # ── Painel de controles (canto direito) ───────────────────────────
-        controles = [
-            "CONTROLES",
-            "W/S  — frente / trás",
-            "A/D  — esquerda / direita",
-            "Q/E  — baixo / cima",
-            "↑↓←→ — girar câmera",
-            "Z/X  — zoom in / out",
-            "SPC  — pausar",
-            "R    — resetar câmera",
-            "ESC  — sair",
+        # ── Controles (direita) ─────────────────────────────────────────────
+        cx = self.larg - 200
+        ctrl = [
+            ("CONTROLES",  C_ACCENT,   True,  14),
+            ("W/S",        C_TEXT_DIM, False, 12),
+            ("A/D",        C_TEXT_DIM, False, 12),
+            ("Q/E",        C_TEXT_DIM, False, 12),
+            ("↑↓←→",      C_TEXT_DIM, False, 12),
+            ("Z/X",        C_TEXT_DIM, False, 12),
+            ("R",          C_TEXT_DIM, False, 12),
+            ("ESPAÇO",     C_TEXT_DIM, False, 12),
+            ("ESC",        C_TEXT_DIM, False, 12),
         ]
-        cx = self.w - 175
-        cy = 12
-        for i, linha in enumerate(controles):
-            cor = CIANO if i == 0 else CINZA_TEXTO
-            fonte = self.fonte_titulo if i == 0 else self.fonte_small
-            self._texto(linha, cx, cy, cor, fonte)
-            cy += fonte.get_height() + 4
+        vals = [
+            ("",              C_ACCENT,   True,  14),
+            ("frente / trás", C_TEXT,     False, 12),
+            ("esq / dir",     C_TEXT,     False, 12),
+            ("baixo / cima",  C_TEXT,     False, 12),
+            ("girar câmera",  C_TEXT,     False, 12),
+            ("zoom",          C_TEXT,     False, 12),
+            ("resetar",       C_TEXT,     False, 12),
+            ("pausar",        C_TEXT,     False, 12),
+            ("menu",          C_TEXT,     False, 12),
+        ]
+        rect_aa(surf, C_PANEL_DK, cx-10, 10, 200, 210, raio=10)
+        rect_aa(surf, (0,0,0,0),  cx-10, 10, 200, 210, raio=10, borda=1, cor_borda=C_BORDER)
 
-        # ── Legenda dos eixos ─────────────────────────────────────────────
-        leg_x, leg_y = self.w - 175, self.h - 75
-        self._texto("EIXOS:", leg_x, leg_y, CINZA_TEXTO, self.fonte_small)
-        self._texto("● X (vermelho)", leg_x, leg_y + 14, VERMELHO_GLOW, self.fonte_small)
-        self._texto("● Y (verde)", leg_x, leg_y + 27, VERDE_NEON, self.fonte_small)
-        self._texto("● Z (azul)", leg_x, leg_y + 40, (80, 140, 255), self.fonte_small)
+        cy2 = 20
+        for (k, kc, kb, ks), (v, vc, vb, vs) in zip(ctrl, vals):
+            texto(surf, k, cx+2,   cy2, kc, "Consolas", ks, bold=kb)
+            texto(surf, v, cx+72,  cy2, vc, "Consolas", vs)
+            cy2 += ks + 5
+
+        # ── Câmera info ─────────────────────────────────────────────────────
+        cy3 = 230
+        rect_aa(surf, C_PANEL_DK, cx-10, cy3, 200, 75, raio=10)
+        rect_aa(surf, (0,0,0,0),  cx-10, cy3, 200, 75, raio=10, borda=1, cor_borda=C_BORDER)
+        texto(surf, "CÂMERA", cx, cy3+8, C_ACCENT, "Consolas", 12, bold=True)
+        px, py2, pz = cam.posicao
+        texto(surf, f"Pos  ({px:+.1f},{py2:+.1f},{pz:+.1f})", cx, cy3+26, C_TEXT_DIM, "Consolas", 10)
+        texto(surf, f"FOV  {cam.fov:.0f}°", cx, cy3+42, C_TEXT_DIM, "Consolas", 10)
+        texto(surf, f"Yaw  {math.degrees(cam.yaw):.0f}°   Pitch {math.degrees(cam.pitch):.0f}°",
+              cx, cy3+56, C_TEXT_DIM, "Consolas", 10)
+
+        # ── Badge ESC ──────────────────────────────────────────────────────
+        rect_aa(surf, C_PANEL_MD, self.larg//2-80, self.alt-36, 160, 26, raio=8)
+        texto(surf, "ESC → voltar ao menu",
+              self.larg//2, self.alt-29, C_TEXT_DIM, "Consolas", 12, centro=True)
+
+        if self._pausado:
+            texto(surf, "⏸  PAUSADO", self.larg//2, self.alt//2 - 20,
+                  C_ACCENT, "Consolas", 22, bold=True, centro=True)
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# LOOP PRINCIPAL
+# MAIN
 # ════════════════════════════════════════════════════════════════════════════
 
 def main():
-    """
-    Loop principal da aplicação de visualização 3D.
-
-    Organização:
-      1. Inicialização do Pygame e criação da janela
-      2. Criação dos objetos 3D e câmera
-      3. Loop principal:
-         a. Processamento de eventos (teclado/mouse)
-         b. Atualização da animação (ângulos, SLERP)
-         c. Renderização (pipeline 3D → 2D)
-         d. HUD overlay
-         e. Display flip (double buffer)
-    """
-
-    # ── 1. Inicialização ──────────────────────────────────────────────────
     pygame.init()
-    pygame.display.set_caption("Visualizador 3D — NumPy + Pygame | CG 2025")
+    pygame.display.set_caption("Visualizador 3D — Sólidos Geométricos | CG 2025")
 
-    LARGURA, ALTURA = 1280, 720
-    tela = pygame.display.set_mode((LARGURA, ALTURA), pygame.RESIZABLE)
+    larg, alt = W, H
+    surf = pygame.display.set_mode((larg, alt), pygame.RESIZABLE)
     clock = pygame.time.Clock()
-    FPS_ALVO = 60
 
-    # ── 2. Objetos 3D ─────────────────────────────────────────────────────
-    vertices_cubo, arestas_cubo = criar_cubo(tamanho=1.0)
-    vertices_piramide, arestas_piramide = criar_piramide(base=0.7, altura=1.4)
-    vertices_grid, arestas_grid = criar_grid(tamanho=7, passo=1.0)
-    eixos = criar_eixos(comprimento=1.5)
+    particulas = criar_particulas(60)
+    menu = Menu(surf, particulas)
+    visualizador = None
+    estado = "menu"   # "menu" ou "viewer"
 
-    # ── 3. Câmera e Renderizador ──────────────────────────────────────────
-    camera = Camera(
-        posicao=np.array([0.0, 3.0, 9.0]),
-        fov=60.0,
-        aspect_ratio=LARGURA / ALTURA
-    )
-    renderizador = Renderizador(tela)
-    hud = HUD(tela)
-
-    # ── 4. Estado da animação ─────────────────────────────────────────────
-    tempo_total = 0.0           # segundos acumulados
-    pausado = False
-
-    # Quatérnios para SLERP Demo:
-    # Transição suave entre dois estados de rotação do cubo
-    q_slerp_inicio = Quaternion.from_axis_angle([1, 0, 0], 0)
-    q_slerp_fim    = Quaternion.from_axis_angle([1, 1, 0], np.pi)
-    t_slerp = 0.0               # parâmetro de interpolação [0→1→0]
-    slerp_direcao = 1           # 1 = avançando, -1 = voltando
-
-    # ── 5. Controle de mouse ──────────────────────────────────────────────
-    mouse_capturado = False
-    ultimo_mouse = (0, 0)
-
-    # ── Loop principal ────────────────────────────────────────────────────
     rodando = True
     while rodando:
+        dt = min(clock.tick(FPS) / 1000.0, 0.05)
 
-        dt = clock.tick(FPS_ALVO) / 1000.0  # delta time em segundos
-        dt = min(dt, 0.05)                    # cap para evitar saltos
+        for p in particulas:
+            p.update(dt, larg, alt)
 
-        if not pausado:
-            tempo_total += dt
-
-        # ── EVENTOS ───────────────────────────────────────────────────────
-        for evento in pygame.event.get():
-
-            if evento.type == pygame.QUIT:
+        for ev in pygame.event.get():
+            if ev.type == pygame.QUIT:
                 rodando = False
 
-            elif evento.type == pygame.KEYDOWN:
-                if evento.key == pygame.K_ESCAPE:
+            elif ev.type == pygame.KEYDOWN and ev.key == pygame.K_ESCAPE:
+                if estado == "viewer":
+                    estado = "menu"
+                    visualizador = None
+                elif estado == "menu":
                     rodando = False
-                elif evento.key == pygame.K_SPACE:
-                    pausado = not pausado
-                elif evento.key == pygame.K_r:
-                    # Reseta câmera
-                    camera.posicao = np.array([0.0, 3.0, 9.0])
-                    camera.yaw = -np.pi / 2
-                    camera.pitch = -0.2
-                    camera.fov = 60.0
-                elif evento.key == pygame.K_m:
-                    # Alterna captura do mouse
-                    mouse_capturado = not mouse_capturado
-                    pygame.mouse.set_visible(not mouse_capturado)
 
-            elif evento.type == pygame.MOUSEBUTTONDOWN:
-                if evento.button == 1:
-                    mouse_capturado = True
-                    pygame.mouse.set_visible(False)
-                    ultimo_mouse = pygame.mouse.get_pos()
+            elif ev.type == pygame.VIDEORESIZE:
+                larg, alt = ev.w, ev.h
+                surf = pygame.display.set_mode((larg, alt), pygame.RESIZABLE)
+                menu.surf = surf
+                menu.larg = larg
+                menu.alt  = alt
+                if visualizador:
+                    visualizador.surf = surf
+                    visualizador.larg = larg
+                    visualizador.alt  = alt
+                    visualizador.renderer.largura = larg
+                    visualizador.renderer.altura  = alt
+                    visualizador.camera.aspect_ratio = larg / alt
 
-            elif evento.type == pygame.MOUSEBUTTONUP:
-                if evento.button == 1:
-                    mouse_capturado = False
-                    pygame.mouse.set_visible(True)
+            elif estado == "menu":
+                resultado = menu.handle_event(ev)
+                if resultado == "viewer":
+                    forma = FORMAS[menu.selecionado]
+                    visualizador = Visualizador(surf, forma, larg, alt)
+                    estado = "viewer"
 
-            elif evento.type == pygame.MOUSEMOTION and mouse_capturado:
-                mx, my = evento.pos
-                dx = mx - ultimo_mouse[0]
-                dy = my - ultimo_mouse[1]
-                camera.rotacionar(dx * 0.005, -dy * 0.005)
-                ultimo_mouse = (mx, my)
+            elif estado == "viewer" and visualizador:
+                resultado = visualizador.handle_event(ev)
+                if resultado == "menu":
+                    estado = "menu"
+                    visualizador = None
 
-            elif evento.type == pygame.VIDEORESIZE:
-                LARGURA, ALTURA = evento.w, evento.h
-                tela = pygame.display.set_mode((LARGURA, ALTURA), pygame.RESIZABLE)
-                camera.aspect_ratio = LARGURA / ALTURA
-                renderizador.largura = LARGURA
-                renderizador.altura = ALTURA
-                hud = HUD(tela)
+        if estado == "menu":
+            menu.update(dt)
+            menu.draw(larg, alt)
+        elif estado == "viewer" and visualizador:
+            visualizador.update(dt)
+            visualizador.draw(fps=clock.get_fps())
 
-        # ── INPUT CONTÍNUO (teclado) ──────────────────────────────────────
-        teclas = pygame.key.get_pressed()
-
-        # Movimento da câmera
-        vel = 4.0 * dt
-        if teclas[pygame.K_w]:      camera.mover_frente(vel)
-        if teclas[pygame.K_s]:      camera.mover_tras(vel)
-        if teclas[pygame.K_a]:      camera.mover_esquerda(vel)
-        if teclas[pygame.K_d]:      camera.mover_direita(vel)
-        if teclas[pygame.K_q]:      camera.mover_baixo(vel)
-        if teclas[pygame.K_e]:      camera.mover_cima(vel)
-
-        # Rotação da câmera com setas
-        rot_vel = 1.5 * dt
-        if teclas[pygame.K_LEFT]:   camera.rotacionar(-rot_vel, 0)
-        if teclas[pygame.K_RIGHT]:  camera.rotacionar( rot_vel, 0)
-        if teclas[pygame.K_UP]:     camera.rotacionar(0,  rot_vel)
-        if teclas[pygame.K_DOWN]:   camera.rotacionar(0, -rot_vel)
-
-        # Zoom
-        if teclas[pygame.K_z]:      camera.zoom(-30 * dt)
-        if teclas[pygame.K_x]:      camera.zoom( 30 * dt)
-
-        # ── ATUALIZAÇÃO DA ANIMAÇÃO ───────────────────────────────────────
-        if not pausado:
-            # SLERP: oscila t entre 0 e 1 suavemente
-            t_slerp += slerp_direcao * dt * 0.4
-            if t_slerp >= 1.0:
-                t_slerp = 1.0
-                slerp_direcao = -1
-            elif t_slerp <= 0.0:
-                t_slerp = 0.0
-                slerp_direcao = 1
-
-        # Quatérnio atual do cubo via SLERP
-        q_cubo_slerp = slerp(q_slerp_inicio, q_slerp_fim, t_slerp)
-
-        # Rotação contínua do cubo: combina SLERP + rotação Y contínua
-        q_spin_y = Quaternion.from_axis_angle([0, 1, 0], tempo_total * 0.8)
-        q_spin_x = Quaternion.from_axis_angle([1, 0, 0], tempo_total * 0.5)
-        q_cubo_total = q_spin_y * q_spin_x * q_cubo_slerp
-
-        # Matriz de rotação do cubo (combina quatérnio → matrix 4×4)
-        mat_rot_cubo = q_cubo_total.to_matrix()
-
-        # Matriz do cubo: escala → rotação → posição na origem
-        mat_cubo = compor(
-            translacao(0, 0.5, 0),   # eleva levemente o cubo
-            mat_rot_cubo,
-            escala(1.0, 1.0, 1.0)
-        )
-
-        # Pirâmide orbita o cubo em um círculo no plano XZ
-        raio_orbita = 3.5
-        velocidade_orbita = 0.7
-        angulo_orbita = tempo_total * velocidade_orbita
-        px = math.cos(angulo_orbita) * raio_orbita
-        pz = math.sin(angulo_orbita) * raio_orbita
-
-        # Pirâmide também gira ao redor do próprio eixo Y
-        q_giro_piramide = Quaternion.from_axis_angle([0, 1, 0], -tempo_total * 1.5)
-        mat_rot_piramide = q_giro_piramide.to_matrix()
-
-        mat_piramide = compor(
-            translacao(px, 0.5, pz),   # posição orbital
-            mat_rot_piramide,            # rotação própria
-        )
-
-        # ── RENDERIZAÇÃO ──────────────────────────────────────────────────
-        # Fundo com gradiente vertical (simulado com retângulos)
-        tela.fill(AZUL_ESCURO)
-
-        # Gradiente sutil no topo
-        for i in range(min(200, ALTURA)):
-            alpha = i / 200
-            cor_grad = (
-                int(AZUL_ESCURO[0] * (1 - alpha) + 15 * alpha),
-                int(AZUL_ESCURO[1] * (1 - alpha) + 20 * alpha),
-                int(AZUL_ESCURO[2] * (1 - alpha) + 50 * alpha),
-            )
-            pygame.draw.line(tela, cor_grad, (0, i), (LARGURA, i))
-
-        # Obtém matrizes da câmera
-        view = camera.get_view_matrix()
-        proj = camera.get_projection_matrix()
-        mat_id = np.eye(4, dtype=float)  # Matriz identidade (sem transformação)
-
-        # Renderiza grid do chão
-        renderizador.superficie = tela
-        renderizador.largura = LARGURA
-        renderizador.altura = ALTURA
-        renderizador.renderizar_objeto(
-            vertices_grid, arestas_grid,
-            mat_id, view, proj,
-            cor=CINZA_GRADE
-        )
-
-        # Renderiza eixos de referência
-        for v_eixo, a_eixo, cor_eixo in eixos:
-            renderizador.renderizar_objeto(
-                v_eixo, a_eixo,
-                mat_id, view, proj,
-                cor=cor_eixo
-            )
-
-        # Renderiza o CUBO com brilho duplo (glow effect)
-        # Primeiro uma versão mais escura (bordas)
-        renderizador.renderizar_objeto(
-            vertices_cubo, arestas_cubo,
-            mat_cubo, view, proj,
-            cor=(0, 80, 120)
-        )
-        # Depois a versão brilhante (CIANO)
-        renderizador.renderizar_objeto(
-            vertices_cubo, arestas_cubo,
-            mat_cubo, view, proj,
-            cor=CIANO
-        )
-
-        # Renderiza a PIRÂMIDE orbitando
-        renderizador.renderizar_objeto(
-            vertices_piramide, arestas_piramide,
-            mat_piramide, view, proj,
-            cor=(200, 80, 255)  # Violeta
-        )
-        # Versão mais brilhante da pirâmide
-        mat_piramide_glow = compor(
-            translacao(px, 0.5, pz),
-            mat_rot_piramide,
-            escala(0.98, 0.98, 0.98)  # Levemente menor para efeito glow
-        )
-        renderizador.renderizar_objeto(
-            vertices_piramide, arestas_piramide,
-            mat_piramide_glow, view, proj,
-            cor=LARANJA
-        )
-
-        # ── HUD Overlay ────────────────────────────────────────────────────
-        fps = clock.get_fps()
-        hud.desenhar(camera, fps, pausado, t_slerp)
-
-        # ── Linha divisória decorativa ─────────────────────────────────────
-        pygame.draw.line(tela, (30, 30, 60), (0, ALTURA - 80), (LARGURA, ALTURA - 80), 1)
-
-        # Mensagem de controle de mouse
-        msg = "  Clique e arraste para girar a câmera"
-        fonte_m = pygame.font.SysFont("Consolas", 11)
-        surf_m = fonte_m.render(msg, True, (60, 60, 90))
-        tela.blit(surf_m, (LARGURA // 2 - surf_m.get_width() // 2, ALTURA - 75))
-
-        # ── Apresenta o frame (double buffer) ─────────────────────────────
         pygame.display.flip()
 
     pygame.quit()
