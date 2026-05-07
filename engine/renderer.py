@@ -31,27 +31,89 @@ class Renderizador:
     """
     Motor de renderização 3D software (sem OpenGL).
     Suporta modo wireframe (Bresenham) e modo sólido (Painter + Phong).
+
+    Aceita tanto (superficie: pygame.Surface) quanto (width, height) como
+    argumentos do construtor — conforme Listing 4 do enunciado.
     """
 
-    def __init__(self, superficie: pygame.Surface):
-        self.superficie = superficie
-        self.largura = superficie.get_width()
-        self.altura = superficie.get_height()
+    def __init__(self, superficie_ou_largura=None, altura=None):
+        """
+        Inicializa o renderizador.
+
+        Formas de uso:
+            Renderizador(pygame_surface)       — usa a surface diretamente
+            Renderizador(800, 600)             — cria imagem interna (conforme enunciado)
+        """
+        if isinstance(superficie_ou_largura, pygame.Surface):
+            # Modo existente: recebe surface do pygame
+            self.superficie = superficie_ou_largura
+            self.largura = self.superficie.get_width()
+            self.altura = self.superficie.get_height()
+            self.image = None
+        elif isinstance(superficie_ou_largura, (int, float)) and altura is not None:
+            # Modo do enunciado: Renderizador(width, height)
+            self.largura = int(superficie_ou_largura)
+            self.altura = int(altura)
+            # Cria imagem interna como np.zeros conforme enunciado
+            self.image = np.zeros((self.altura, self.largura, 3))
+            # Cria surface do pygame para rasterização
+            self.superficie = pygame.Surface((self.largura, self.altura))
+        else:
+            # Fallback
+            self.largura = 800
+            self.altura = 600
+            self.image = np.zeros((self.altura, self.largura, 3))
+            self.superficie = pygame.Surface((self.largura, self.altura))
 
     # ════════════════════════════════════════════════════════════════════════
     # Utilitários internos
     # ════════════════════════════════════════════════════════════════════════
 
     def _clip_to_ndc_screen(self, v_clip: np.ndarray) -> Optional[Tuple[int,int]]:
-        """Converte um vértice clip-space para pixel. None se fora da câmera."""
+        """
+        Converte um vértice clip-space para pixel na tela.
+
+        Passos 4, 5 e 6 do pipeline:
+          4. Recorte (clipping) — descarta vértices fora do cubo NDC [-1, 1]
+          5. Divisão por w       — converte coordenadas homogêneas para NDC
+          6. Mapeamento viewport — converte NDC [-1,1] para pixels [0, largura/altura]
+
+        Retorna None se o vértice está fora do frustum.
+        """
         w = v_clip[3]
+        # Passo 4: Clipping — vértice atrás da câmera
         if w <= 1e-6:
             return None
+        # Passo 5: Divisão por w (perspectiva dividida)
         nx = v_clip[0] / w
         ny = v_clip[1] / w
+        nz = v_clip[2] / w
+        # Passo 4: Recorte no cubo normalizado (com margem para evitar pop-in)
+        if nx < -2.0 or nx > 2.0 or ny < -2.0 or ny > 2.0 or nz < -1.0 or nz > 1.0:
+            return None
+        # Passo 6: Mapeamento para coordenadas do dispositivo (viewport)
         px = int((nx + 1.0) * 0.5 * self.largura)
         py = int((1.0 - ny) * 0.5 * self.altura)
         return (px, py)
+
+    def _transform_vertices(self, vertices, matrix):
+        """
+        Aplica transformação a vértices (conforme Listing 4 do enunciado).
+
+        Converte vértices (N, 3) para coordenadas homogêneas (N, 4),
+        multiplica pela matriz de transformação e retorna (N, 4).
+
+        Args:
+            vertices: array (N, 3) de pontos 3D
+            matrix: matriz de transformação 4×4
+
+        Returns:
+            array (N, 4) de vértices transformados em coordenadas homogêneas
+        """
+        n = len(vertices)
+        verts_h = np.ones((n, 4), dtype=float)
+        verts_h[:, :3] = vertices[:, :3] if vertices.shape[1] >= 3 else vertices
+        return (matrix @ verts_h.T).T
 
     @staticmethod
     def _face_normal(world_verts: np.ndarray, face: Tuple) -> np.ndarray:
@@ -116,8 +178,9 @@ class Renderizador:
         world_verts  = (mat_modelo   @ verts_h.T).T   # (N,4) — normais e backface
         view_verts   = (model_view   @ verts_h.T).T   # (N,4) — depth sorting
         clip_verts   = (mvp          @ verts_h.T).T   # (N,4) — tela
-
-        model_center = mat_modelo[:3, 3]   # origem do objeto em espaço-mundo
+        # Fill light (luz de preenchimento — suaviza sombras)
+        fill_light_dir = np.array([-0.4, -0.6, 0.5], dtype=float)
+        fill_light_dir = fill_light_dir / (np.linalg.norm(fill_light_dir) + 1e-10)
 
         drawable = []
 
@@ -139,41 +202,51 @@ class Renderizador:
             if np.linalg.norm(normal) < 1e-10:
                 continue
 
-            # Garante que a normal aponta para FORA do sólido
-            centroid_w = np.mean(world_verts[[i for i in face], :3], axis=0)
-            if np.dot(normal, centroid_w - model_center) < 0:
-                normal = -normal
-
             # ── Backface Culling ───────────────────────────────────────────
+            # A normal da face vem do winding dos vértices (CCW = outward).
             # Se a normal aponta para o mesmo lado que o vetor câmera→face,
             # estamos vendo o VERSO da face → descarta.
+            centroid_w = np.mean(world_verts[[i for i in face], :3], axis=0)
             view_dir_to_face = centroid_w - camera_pos
             if np.dot(normal, view_dir_to_face) >= 0:
                 continue
 
             # ── Profundidade (Z em view space para ordenação) ──────────────
-            depth = float(np.mean([view_verts[i, 2] for i in face]))
+            # Usa a profundidade MÁXIMA (mais distante) da face para
+            # reduzir artefatos de Z-fighting no algoritmo do pintor.
+            depth = float(np.min([view_verts[i, 2] for i in face]))
 
-            # ── Iluminação Blinn-Phong ─────────────────────────────────────
-            # Componente difusa (Lambertiana)
-            diff = max(0.0, np.dot(normal, luz))
-
-            # Componente especular (Blinn-Phong halfway vector)
+            # ── Iluminação Blinn-Phong aprimorada ─────────────────────────
+            # Vetor da câmera para a face
             v_dir = camera_pos - centroid_w
             v_len = np.linalg.norm(v_dir)
             if v_len > 1e-10:
                 v_dir = v_dir / v_len
+
+            # --- Luz principal (key light) ---
+            diff = max(0.0, np.dot(normal, luz))
+
+            # Halfway vector para especular
             H = luz + v_dir
             H_len = np.linalg.norm(H)
             H = H / H_len if H_len > 1e-10 else H
-            spec = max(0.0, np.dot(normal, H)) ** 64    # shininess = 64
+            spec = max(0.0, np.dot(normal, H)) ** 48
 
-            # Combinação final
-            Ka = 0.18   # ambiente
-            Kd = 0.70   # difuso
-            Ks = 0.45   # especular
-            intensity = Ka + Kd * diff + Ks * spec
-            intensity = min(1.0, intensity)
+            # --- Fill light (luz de preenchimento inferior-esquerda) ---
+            # Ilumina as sombras suavemente para não ficarem completamente escuras
+            diff_fill = max(0.0, np.dot(normal, fill_light_dir)) * 0.25
+
+            # --- Rim light (efeito Fresnel) ---
+            # Faces quase perpendiculares ao olhar ganham um brilho sutil na borda
+            ndotv = max(0.0, np.dot(normal, v_dir))
+            rim = (1.0 - ndotv) ** 3 * 0.30
+
+            # Combinação final de iluminação
+            Ka = 0.15    # ambiente base
+            Kd = 0.62    # difuso (key light)
+            Ks = 0.35    # especular
+            intensity = Ka + Kd * diff + Ks * spec + diff_fill + rim
+            intensity = min(1.0, max(0.0, intensity))
 
             fill = (
                 min(255, int(cor_base[0] * intensity)),
@@ -191,17 +264,30 @@ class Renderizador:
         for depth, pts, fill, normal in drawable:
             pygame.draw.polygon(self.superficie, fill, pts)
             if bordas:
-                # Borda ligeiramente mais escura para definição de arestas
+                # Borda anti-aliased com cor misturada (mais sutil e elegante)
                 edge = (
-                    max(0, fill[0] - 55),
-                    max(0, fill[1] - 55),
-                    max(0, fill[2] - 55),
+                    max(0, int(fill[0] * 0.55)),
+                    max(0, int(fill[1] * 0.55)),
+                    max(0, int(fill[2] * 0.55)),
                 )
-                pygame.draw.polygon(self.superficie, edge, pts, 1)
+                pygame.draw.aalines(self.superficie, edge, True, pts)
 
     # ════════════════════════════════════════════════════════════════════════
     # MODO WIREFRAME — Rasterização com Bresenham
     # ════════════════════════════════════════════════════════════════════════
+
+    def _draw_line(self, p1, p2, cor):
+        """
+        Desenha linha entre dois pontos na tela (algoritmo de Bresenham).
+
+        Alias conforme Listing 4 do enunciado.
+
+        Args:
+            p1: tupla (x, y) do ponto inicial
+            p2: tupla (x, y) do ponto final
+            cor: tupla RGB da cor
+        """
+        self.bresenham_linha(p1[0], p1[1], p2[0], p2[1], cor)
 
     def bresenham_linha(self, x0:int, y0:int, x1:int, y1:int, cor:Tuple):
         """
@@ -252,3 +338,49 @@ class Renderizador:
             p2 = self._clip_to_ndc_screen(v2)
             if p1 and p2:
                 self.bresenham_linha(p1[0], p1[1], p2[0], p2[1], cor)
+
+    # ════════════════════════════════════════════════════════════════════════
+    # MÉTODO render() — Interface conforme enunciado (Listing 4)
+    # ════════════════════════════════════════════════════════════════════════
+
+    def render(self, objetos, camera):
+        """
+        Pipeline completo de renderização — conforme Listing 4 do enunciado.
+
+        Executa os 7 passos do pipeline para cada objeto:
+          1. Obter matrizes da câmera (View e Projection)
+          2. Transformação Model-View-Projection
+          3. Transformar vértices para coordenadas normalizadas
+          4. Recorte (clipping) no cubo normalizado [-1,1]
+          5. Perspectiva dividida (divisão por w)
+          6. Mapeamento para coordenadas do dispositivo (viewport)
+          7. Rasterização das arestas (Bresenham 3D)
+
+        Args:
+            objetos: lista de Objeto3D
+            camera: instância de Camera
+        """
+        # Passo 1: Obter matrizes da câmera
+        V = camera.get_view_matrix()
+        P = camera.get_projection_matrix()
+
+        for obj in objetos:
+            # Passo 2: Transformação Model-View-Projection
+            mvp = P @ V @ obj.model_matrix
+
+            # Passo 3: Transformar vértices para coordenadas clip
+            vertices_clip = self._transform_vertices(obj.vertices, mvp)
+
+            # Converter cor de [0,1] para [0,255] se necessário
+            cor = obj.cor
+            if isinstance(cor, (list, tuple)) and len(cor) >= 3:
+                if all(isinstance(c, float) and c <= 1.0 for c in cor):
+                    cor = (int(cor[0]*255), int(cor[1]*255), int(cor[2]*255))
+
+            # Passos 4-7: Clipping, divisão por w, viewport, rasterização
+            for i, j in obj.arestas:
+                v1, v2 = vertices_clip[i], vertices_clip[j]
+                p1 = self._clip_to_ndc_screen(v1)
+                p2 = self._clip_to_ndc_screen(v2)
+                if p1 and p2:
+                    self.bresenham_linha(p1[0], p1[1], p2[0], p2[1], cor)

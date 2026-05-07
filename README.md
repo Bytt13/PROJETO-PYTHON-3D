@@ -35,13 +35,24 @@ python main.py
 ## 📁 Estrutura do Projeto
 
 ```
-COMP GRAFICA/
+projetoPython/
 │
-├── main.py         # Loop principal: cena, animação, HUD
-├── transforms.py   # Parte 1: Biblioteca de transformações 4×4
-├── quaternion.py   # Parte 2: Quatérnios e SLERP
-├── camera.py       # Parte 3: Câmera virtual, View & Projection Matrix
-└── renderer.py     # Parte 4: Pipeline de 7 passos + Bresenham
+├── main.py                    # Ponto de entrada: menu + visualizador interativo
+├── requirements.txt           # Dependências do projeto
+├── .gitignore                 # Arquivos ignorados pelo Git
+│
+├── engine/                    # Pacote do motor 3D
+│   ├── __init__.py            # Exporta a API pública do engine
+│   ├── transforms.py          # Parte 1: Biblioteca de transformações 4×4
+│   ├── quaternion.py          # Parte 2: Quatérnios de Hamilton + SLERP
+│   ├── camera.py              # Parte 3: Câmera virtual + projeção perspectiva
+│   ├── renderer.py            # Parte 4: Pipeline de 7 passos + Bresenham
+│   └── mesh.py                # Objetos 3D (Objeto3D + Mesh) + catálogo de sólidos
+│
+├── docs/                      # Documentação e imagens do enunciado
+│   └── *.jpeg                 # Páginas do enunciado do trabalho
+│
+└── README.md                  # Este arquivo
 ```
 
 ---
@@ -173,20 +184,20 @@ A aplicação mostra:
 
 | Conceito | Arquivo | Função/Classe |
 |---------:|---------|---------------|
-| Coord. Homogêneas | `transforms.py` | `translacao()`, `escala()` |
-| Rotações Euler | `transforms.py` | `rotacao_x/y/z()` |
-| Cisalhamento | `transforms.py` | `cisalhamento_xy()` |
-| Composição de matrizes | `transforms.py` | `compor()` |
-| Quatérnio de Hamilton | `quaternion.py` | `class Quaternion` |
-| Produto de Hamilton | `quaternion.py` | `__mul__()` |
-| Conversão eixo/ângulo | `quaternion.py` | `from_axis_angle()` |
-| Rotação q·p·q* | `quaternion.py` | `rotate_point()` |
-| SLERP | `quaternion.py` | `slerp()` |
-| Sistema UVN | `camera.py` | `_calcular_uvn()` |
-| View Matrix (LookAt) | `camera.py` | `get_view_matrix()` |
-| Projeção Perspectiva | `camera.py` | `get_projection_matrix()` |
-| Pipeline MVP | `renderer.py` | `transformar_vertices()` |
-| Clipping | `renderer.py` | `recortar_aresta()` |
-| Divisão por W | `renderer.py` | `divisao_perspectiva()` |
-| Mapeamento Viewport | `renderer.py` | `ndc_para_viewport()` |
-| Algoritmo Bresenham | `renderer.py` | `bresenham_linha()` |
+| Coord. Homogêneas | `engine/transforms.py` | `translacao()`, `escala()` |
+| Rotações Euler | `engine/transforms.py` | `rotacao_x/y/z()` |
+| Cisalhamento | `engine/transforms.py` | `cisalhamento_xy()` |
+| Composição de matrizes | `engine/transforms.py` | `compor()` |
+| Quatérnio de Hamilton | `engine/quaternion.py` | `class Quaternion` |
+| Produto de Hamilton | `engine/quaternion.py` | `__mul__()` |
+| Conversão eixo/ângulo | `engine/quaternion.py` | `from_axis_angle()` |
+| Rotação q·p·q* | `engine/quaternion.py` | `rotate_point()` |
+| SLERP | `engine/quaternion.py` | `slerp()` |
+| Sistema UVN | `engine/camera.py` | `_calcular_uvn()` / `_compute_vectors()` |
+| View Matrix (LookAt) | `engine/camera.py` | `get_view_matrix()` |
+| Projeção Perspectiva | `engine/camera.py` | `get_projection_matrix()` |
+| Objeto 3D | `engine/mesh.py` | `class Objeto3D` |
+| Pipeline MVP | `engine/renderer.py` | `_transform_vertices()` |
+| Clipping + Viewport | `engine/renderer.py` | `_clip_to_ndc_screen()` |
+| Pipeline render() | `engine/renderer.py` | `render()` |
+| Algoritmo Bresenham | `engine/renderer.py` | `bresenham_linha()` / `_draw_line()` |

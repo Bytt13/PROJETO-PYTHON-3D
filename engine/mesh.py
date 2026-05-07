@@ -25,6 +25,71 @@ class Mesh:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Classe Objeto3D — Interface conforme enunciado (Listing 4)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class Objeto3D:
+    """
+    Representa um objeto 3D com vértices, arestas e transformações.
+
+    Interface conforme Listing 4 do enunciado:
+      - vertices:     lista de pontos 3D (x, y, z)
+      - arestas:      lista de pares (i, j) índices dos vértices
+      - cor:          cor RGB (0 a 1)
+      - model_matrix: matriz de transformação do modelo (4x4)
+
+    A model_matrix acumula transformações aplicadas ao objeto.
+    Ao chamar apply_transform(M), a model_matrix é atualizada:
+        model_matrix = M @ model_matrix
+    """
+
+    def __init__(self, vertices, arestas, cor=(0, 0, 1)):
+        """
+        Cria um objeto 3D.
+
+        Args:
+            vertices: lista de pontos 3D (x, y, z)
+            arestas: lista de pares (i, j) índices dos vértices
+            cor: cor RGB (componentes de 0 a 1)
+        """
+        self.vertices = np.array(vertices, dtype=float)
+        self.arestas = arestas
+        self.cor = cor
+        self.model_matrix = np.eye(4)    # matriz do modelo (identidade)
+
+    def apply_transform(self, matrix):
+        """
+        Aplica transformação ao objeto.
+
+        Acumula a transformação na model_matrix:
+            model_matrix = matrix @ model_matrix
+
+        Args:
+            matrix: matriz de transformação 4×4 (numpy array)
+        """
+        self.model_matrix = matrix @ self.model_matrix
+
+    def get_transformed_vertices(self):
+        """
+        Retorna vértices transformados pela matriz do modelo.
+
+        Converte cada vértice (x, y, z) para coordenadas homogêneas
+        (x, y, z, 1), aplica self.model_matrix, e retorna os
+        vértices transformados como array (N, 4).
+
+        Returns:
+            np.ndarray de shape (N, 4) com vértices em coordenadas
+            homogêneas transformados pela model_matrix.
+        """
+        n = len(self.vertices)
+        # Converter para coordenadas homogêneas [x, y, z, 1]
+        verts_h = np.ones((n, 4), dtype=float)
+        verts_h[:, :3] = self.vertices
+        # Aplicar model_matrix
+        return (self.model_matrix @ verts_h.T).T
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Utilitários
 # ─────────────────────────────────────────────────────────────────────────────
 

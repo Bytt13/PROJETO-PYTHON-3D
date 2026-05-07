@@ -177,6 +177,15 @@ class Quaternion:
             [                0,                 0,                  0, 1]
         ], dtype=float)
 
+    def to_rotation_matrix(self) -> np.ndarray:
+        """
+        Converte o quatérnio para uma matriz de rotação 4×4.
+
+        Alias conforme Listing 5 do enunciado (Exemplo de Uso):
+            cubo.apply_transform(q.to_rotation_matrix())
+        """
+        return self.to_matrix()
+
     def rotate_point(self, point: np.ndarray) -> np.ndarray:
         """
         Aplica a rotação do quatérnio a um ponto 3D.

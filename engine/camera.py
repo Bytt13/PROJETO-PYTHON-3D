@@ -74,7 +74,13 @@ class Camera:
         fov: float = 60.0,
         aspect_ratio: float = 16/9,
         z_near: float = 0.1,
-        z_far: float = 100.0
+        z_far: float = 100.0,
+        # Aliases conforme Listing 3 do enunciado
+        eye: np.ndarray = None,
+        at: np.ndarray = None,
+        aspect: float = None,
+        near: float = None,
+        far: float = None
     ):
         """
         Inicializa a câmera.
@@ -88,6 +94,18 @@ class Camera:
             z_near: distância do plano de recorte próximo (mínimo visível)
             z_far: distância do plano de recorte distante (máximo visível)
         """
+        # Suporta aliases do enunciado: eye → posicao, at → alvo
+        if eye is not None:
+            posicao = eye
+        if at is not None:
+            alvo = at
+        if aspect is not None:
+            aspect_ratio = aspect
+        if near is not None:
+            z_near = near
+        if far is not None:
+            z_far = far
+
         self.posicao = np.array(posicao if posicao is not None else [0, 2, 8], dtype=float)
         self.alvo = np.array(alvo if alvo is not None else [0, 0, 0], dtype=float)
         self.up_mundo = np.array(up if up is not None else [0, 1, 0], dtype=float)
@@ -106,6 +124,14 @@ class Camera:
         self.pitch = -0.2
 
     # ── Sistema de coordenadas UVN ────────────────────────────────────────────
+
+    def _compute_vectors(self):
+        """
+        Calcula os vetores n, v, u da câmera (Seção 2.10.1).
+
+        Alias para _calcular_uvn — conforme Listing 3 do enunciado.
+        """
+        return self._calcular_uvn()
 
     def _calcular_uvn(self):
         """
@@ -181,13 +207,15 @@ class Camera:
         u, v, n = self._calcular_uvn()
         p = self.posicao
 
-        # Parte de rotação: cada eixo da câmera vira uma linha da matriz
-        # O produto escalar com -p faz a translação inversa
+        # Parte de rotação: cada eixo da câmera vira uma linha da matriz.
+        # A terceira linha usa -n (convenção OpenGL: câmera olha para -Z no view space).
+        # O -1 na projection matrix [3][2] converte z_view negativo em w positivo,
+        # fazendo objetos na frente da câmera passarem no clipping (w > 0).
         return np.array([
-            [u[0], u[1], u[2], -np.dot(u, p)],
-            [v[0], v[1], v[2], -np.dot(v, p)],
-            [n[0], n[1], n[2], -np.dot(n, p)],
-            [   0,    0,    0,              1]
+            [ u[0],  u[1],  u[2], -np.dot(u, p)],
+            [ v[0],  v[1],  v[2], -np.dot(v, p)],
+            [-n[0], -n[1], -n[2],  np.dot(n, p)],
+            [    0,     0,     0,              1]
         ], dtype=float)
 
     def get_projection_matrix(self) -> np.ndarray:
