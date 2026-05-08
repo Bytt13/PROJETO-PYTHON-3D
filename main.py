@@ -7,7 +7,7 @@
    ↑ / ↓      → navegar entre os sólidos
    ENTER      → entrar no visualizador
 
- Controles no VISUALIZADOR:
+ Controles no VISUALIZADOR (modo AUTO):
    W/S        → mover câmera frente/trás
    A/D        → mover câmera esquerda/direita
    Q/E        → mover câmera baixo/cima
@@ -15,7 +15,28 @@
    Z/X        → zoom (ajustar FOV)
    R          → resetar câmera
    ESPAÇO     → pausar rotação automática
+   TAB        → alternar para modo MANUAL
    ESC        → voltar ao menu
+
+ Controles no VISUALIZADOR (modo MANUAL):
+   TAB        → voltar ao modo AUTO
+   1-7        → selecionar transformação ativa
+   Mouse drag → ajustar parâmetros da transformação ativa
+   Scroll     → ajuste fino (eixo Z / escala / ângulo)
+   BACKSPACE  → resetar transformação selecionada
+   Click      → selecionar card de transformação no painel
+   Setas      → girar câmera (mantido)
+   R          → resetar câmera
+   ESC        → voltar ao menu
+
+ Transformações disponíveis no modo MANUAL:
+   1 Translação    — mouse X→TX, Y→TY, scroll→TZ
+   2 Escala         — mouse Y→uniforme, scroll→uniforme
+   3 Rotação X      — mouse Y→ângulo (Euler)
+   4 Rotação Y      — mouse X→ângulo (Euler)
+   5 Rotação Z      — mouse X→ângulo (Euler)
+   6 SLERP          — mouse X→t (interpolação quaternion)
+   7 Cisalhamento   — mouse X→a, Y→b (shear XY)
 
 =============================================================================
 """
@@ -26,7 +47,7 @@ import random
 import numpy as np
 import pygame
 
-from engine.transforms import translacao, escala, rotacao_x, rotacao_y, rotacao_z, compor
+from engine.transforms import translacao, escala, rotacao_x, rotacao_y, rotacao_z, cisalhamento_xy, compor
 from engine.quaternion import Quaternion, slerp as q_slerp
 from engine.camera import Camera
 from engine.renderer import Renderizador
@@ -683,6 +704,21 @@ class Visualizador:
         self._mouse_drag = False
         self._ultimo_mouse = (0, 0)
 
+        # ── Modo manual interativo ──────────────────────────────────────
+        self._modo_manual    = False
+        self._transf_ativa   = 1        # 1..7
+        self._manual_tx      = 0.0
+        self._manual_ty      = 0.0
+        self._manual_tz      = 0.0
+        self._manual_esc     = 1.0      # escala uniforme
+        self._manual_rx      = 0.0      # rotação Euler X (rad)
+        self._manual_ry      = 0.0      # rotação Euler Y (rad)
+        self._manual_rz      = 0.0      # rotação Euler Z (rad)
+        self._manual_slerp_t = 0.0
+        self._manual_shear_a = 0.0
+        self._manual_shear_b = 0.0
+        self._hud_cards      = []       # [(pygame.Rect, id), ...]
+
     def handle_event(self, ev):
         """Retorna 'menu' se ESC, None caso contrário."""
         if ev.type == pygame.KEYDOWN:
@@ -696,21 +732,100 @@ class Visualizador:
                 self.camera.yaw   = -math.pi / 2
                 self.camera.pitch = -0.22
                 self.camera.fov   = 55.0
+            # Toggle modo manual
+            if ev.key == pygame.K_TAB:
+                self._modo_manual = not self._modo_manual
+            # Selecionar transformação ativa (1-7)
+            if self._modo_manual:
+                _NUM_KEYS = [pygame.K_1, pygame.K_2, pygame.K_3,
+                             pygame.K_4, pygame.K_5, pygame.K_6, pygame.K_7]
+                for i, k in enumerate(_NUM_KEYS, start=1):
+                    if ev.key == k:
+                        self._transf_ativa = i
+                if ev.key == pygame.K_BACKSPACE:
+                    self._resetar_transf_ativa()
 
+        # Mouse click — selecionar card no HUD ou iniciar drag
         if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
-            self._mouse_drag = True
-            self._ultimo_mouse = ev.pos
+            clicou_card = False
+            if self._modo_manual:
+                mx, my = ev.pos
+                for rect, tid in self._hud_cards:
+                    if rect.collidepoint(mx, my):
+                        self._transf_ativa = tid
+                        clicou_card = True
+                        break
+            if not clicou_card:
+                self._mouse_drag = True
+                self._ultimo_mouse = ev.pos
+
         if ev.type == pygame.MOUSEBUTTONUP and ev.button == 1:
             self._mouse_drag = False
+
         if ev.type == pygame.MOUSEMOTION and self._mouse_drag:
             dx = ev.pos[0] - self._ultimo_mouse[0]
             dy = ev.pos[1] - self._ultimo_mouse[1]
-            self.camera.rotacionar(dx * 0.005, -dy * 0.005)
+            if self._modo_manual:
+                self._aplicar_mouse_manual(dx, dy)
+            else:
+                self.camera.rotacionar(dx * 0.005, -dy * 0.005)
             self._ultimo_mouse = ev.pos
+
+        # Scroll wheel — ajuste fino no modo manual
+        if hasattr(pygame, 'MOUSEWHEEL') and ev.type == pygame.MOUSEWHEEL:
+            if self._modo_manual:
+                self._aplicar_scroll_manual(ev.y)
+
         return None
 
+    # ── Helpers do modo manual ──────────────────────────────────────────
+
+    def _resetar_transf_ativa(self):
+        """Reseta a transformação ativa para valores padrão."""
+        t = self._transf_ativa
+        if t == 1:   self._manual_tx = self._manual_ty = self._manual_tz = 0.0
+        elif t == 2: self._manual_esc = 1.0
+        elif t == 3: self._manual_rx = 0.0
+        elif t == 4: self._manual_ry = 0.0
+        elif t == 5: self._manual_rz = 0.0
+        elif t == 6: self._manual_slerp_t = 0.0
+        elif t == 7: self._manual_shear_a = self._manual_shear_b = 0.0
+
+    def _aplicar_mouse_manual(self, dx, dy):
+        """Aplica movimento do mouse à transformação ativa."""
+        t = self._transf_ativa
+        s = 0.01                        # sensibilidade base
+        if t == 1:                      # Translação
+            self._manual_tx += dx * s
+            self._manual_ty -= dy * s
+        elif t == 2:                    # Escala uniforme
+            self._manual_esc = max(0.1, self._manual_esc - dy * s)
+        elif t == 3:                    # Rotação X
+            self._manual_rx += dy * s * 2
+        elif t == 4:                    # Rotação Y
+            self._manual_ry += dx * s * 2
+        elif t == 5:                    # Rotação Z
+            self._manual_rz += dx * s * 2
+        elif t == 6:                    # SLERP
+            self._manual_slerp_t = clamp(self._manual_slerp_t + dx * s, 0.0, 1.0)
+        elif t == 7:                    # Cisalhamento
+            self._manual_shear_a += dx * s
+            self._manual_shear_b -= dy * s
+
+    def _aplicar_scroll_manual(self, direcao):
+        """Aplica scroll do mouse à transformação ativa."""
+        t = self._transf_ativa
+        p = 0.1                         # passo por tick
+        if t == 1:   self._manual_tz += direcao * p
+        elif t == 2: self._manual_esc = max(0.1, self._manual_esc + direcao * p)
+        elif t == 3: self._manual_rx += direcao * p * 0.5
+        elif t == 4: self._manual_ry += direcao * p * 0.5
+        elif t == 5: self._manual_rz += direcao * p * 0.5
+        elif t == 6: self._manual_slerp_t = clamp(self._manual_slerp_t + direcao * 0.05, 0.0, 1.0)
+        elif t == 7: self._manual_shear_a += direcao * p * 0.2
+
     def update(self, dt):
-        if not self._pausado:
+        if not self._pausado and not self._modo_manual:
             self._tempo   += dt
             # Rotação automática do sólido via produto de quatérnios
             self._q_rot    = self._q_spin * self._q_rot
@@ -755,15 +870,28 @@ class Visualizador:
             pygame.draw.line(surf, (r,g,b), (0,i+2), (self.larg,i+2))
             pygame.draw.line(surf, (r,g,b), (0,i+3), (self.larg,i+3))
 
-        # ── Matriz de modelo: aplica rotação do quatérnio ──────────────────
-        # Combina rotação automática com toque do SLERP
-        q_slerp_atual = q_slerp(self._q_A, self._q_B, self._t_slerp)
-        q_total = self._q_rot * q_slerp_atual
-        mat_rot = q_total.to_matrix()
-
-        # Escala para que objetos muito grandes ou pequenos caibam bem
+        # ── Matriz de modelo ────────────────────────────────────────────────
         escala_auto = 1.3 / max(0.01, float(np.max(np.abs(forma.vertices))))
-        mat_modelo = compor(mat_rot, escala(escala_auto, escala_auto, escala_auto))
+        mat_esc_base = escala(escala_auto, escala_auto, escala_auto)
+
+        if self._modo_manual:
+            # Composição manual de todas as transformações
+            m_trans  = translacao(self._manual_tx, self._manual_ty, self._manual_tz)
+            m_esc    = escala(self._manual_esc, self._manual_esc, self._manual_esc)
+            m_rx     = rotacao_x(self._manual_rx)
+            m_ry     = rotacao_y(self._manual_ry)
+            m_rz     = rotacao_z(self._manual_rz)
+            m_shear  = cisalhamento_xy(self._manual_shear_a, self._manual_shear_b)
+            q_sl     = q_slerp(self._q_A, self._q_B, self._manual_slerp_t)
+            m_slerp  = q_sl.to_matrix()
+            # Ordem: base → shear → escala → rotações Euler → slerp → translação
+            mat_modelo = compor(m_trans, m_slerp, m_rz, m_ry, m_rx, m_esc, m_shear, mat_esc_base)
+        else:
+            # Modo automático (original)
+            q_slerp_atual = q_slerp(self._q_A, self._q_B, self._t_slerp)
+            q_total = self._q_rot * q_slerp_atual
+            mat_rot = q_total.to_matrix()
+            mat_modelo = compor(mat_rot, mat_esc_base)
 
         view = self.camera.get_view_matrix()
         proj = self.camera.get_projection_matrix()
@@ -809,7 +937,7 @@ class Visualizador:
         forma = self.forma
         cam   = self.camera
 
-        # ── Painel esquerdo ─────────────────────────────────────────────────
+        # ── Painel esquerdo (info do sólido) ─────────────────────────────
         rect_aa(surf, C_PANEL_DK, 10, 10, 280, 135, raio=12)
         rect_aa(surf, (0,0,0,0),  10, 10, 280, 135, raio=12, borda=1, cor_borda=C_BORDER)
         pygame.draw.rect(surf, forma.cor, (10, 10, 280, 4), border_radius=12)
@@ -827,44 +955,85 @@ class Visualizador:
         # FPS
         texto(surf, f"FPS: {fps:5.1f}", 22, py+2, C_ACCENT, "Consolas", 13, bold=True)
 
-        # ── Painel SLERP ───────────────────────────────────────────────────
-        rect_aa(surf, C_PANEL_DK, 10, H-64, 265, 52, raio=10)
-        rect_aa(surf, (0,0,0,0),  10, H-64, 265, 52, raio=10, borda=1, cor_borda=C_BORDER)
-        texto(surf, "SLERP  (interpolação de rotação)",
-              18, H-58, C_TEXT_DIM, "Consolas", 11)
+        # ── Badge de modo (AUTO / MANUAL) ──────────────────────────────
+        if self._modo_manual:
+            badge_cor = C_ACCENT2
+            badge_txt = "MODO: MANUAL"
+        else:
+            badge_cor = C_ACCENT
+            badge_txt = "MODO: AUTO"
+        rect_aa(surf, C_PANEL_DK, 10, 152, 280, 24, raio=8)
+        rect_aa(surf, (0,0,0,0),  10, 152, 280, 24, raio=8, borda=1, cor_borda=badge_cor)
+        texto(surf, badge_txt, 150, 157, badge_cor, "Consolas", 13, bold=True, centro=True)
+
+        # ── Painel de Transformações (modo manual) ─────────────────────
+        if self._modo_manual:
+            self._draw_hud_manual()
+
+        # ── Painel SLERP ───────────────────────────────────────────────
+        slerp_t = self._manual_slerp_t if self._modo_manual else self._t_slerp
+        alt_h = self.alt
+        rect_aa(surf, C_PANEL_DK, 10, alt_h-64, 265, 52, raio=10)
+        rect_aa(surf, (0,0,0,0),  10, alt_h-64, 265, 52, raio=10, borda=1, cor_borda=C_BORDER)
+        lbl = "SLERP  (mouse drag)" if self._modo_manual else "SLERP  (interpolação de rotação)"
+        texto(surf, lbl, 18, alt_h-58, C_TEXT_DIM, "Consolas", 11)
 
         bw = 230
-        pygame.draw.rect(surf, (30,30,60), (18, H-42, bw, 10), border_radius=5)
-        fill_w = int(self._t_slerp * bw)
+        pygame.draw.rect(surf, (30,30,60), (18, alt_h-42, bw, 10), border_radius=5)
+        fill_w = int(slerp_t * bw)
         if fill_w > 0:
-            pygame.draw.rect(surf, C_ACCENT2, (18, H-42, fill_w, 10), border_radius=5)
-        pygame.draw.rect(surf, C_BORDER,    (18, H-42, bw, 10), 1, border_radius=5)
-        texto(surf, f"t={self._t_slerp:.2f}", 258, H-44, C_ACCENT2, "Consolas", 11)
+            pygame.draw.rect(surf, C_ACCENT2, (18, alt_h-42, fill_w, 10), border_radius=5)
+        pygame.draw.rect(surf, C_BORDER,    (18, alt_h-42, bw, 10), 1, border_radius=5)
+        texto(surf, f"t={slerp_t:.2f}", 258, alt_h-44, C_ACCENT2, "Consolas", 11)
 
-        # ── Controles (direita) ─────────────────────────────────────────────
+        # ── Controles (direita) ────────────────────────────────────────
         cx = self.larg - 200
-        ctrl = [
-            ("CONTROLES",  C_ACCENT,   True,  14),
-            ("W/S",        C_TEXT_DIM, False, 12),
-            ("A/D",        C_TEXT_DIM, False, 12),
-            ("Q/E",        C_TEXT_DIM, False, 12),
-            ("Setas",      C_TEXT_DIM, False, 12),
-            ("Z/X",        C_TEXT_DIM, False, 12),
-            ("R",          C_TEXT_DIM, False, 12),
-            ("ESPAÇO",     C_TEXT_DIM, False, 12),
-            ("ESC",        C_TEXT_DIM, False, 12),
-        ]
-        vals = [
-            ("",              C_ACCENT,   True,  14),
-            ("frente / trás", C_TEXT,     False, 12),
-            ("esq / dir",     C_TEXT,     False, 12),
-            ("baixo / cima",  C_TEXT,     False, 12),
-            ("girar câmera",  C_TEXT,     False, 12),
-            ("zoom",          C_TEXT,     False, 12),
-            ("resetar",       C_TEXT,     False, 12),
-            ("pausar",        C_TEXT,     False, 12),
-            ("menu",          C_TEXT,     False, 12),
-        ]
+        if self._modo_manual:
+            ctrl = [
+                ("MODO MANUAL",  C_ACCENT2,  True,  14),
+                ("Mouse",        C_TEXT_DIM, False, 12),
+                ("Scroll",       C_TEXT_DIM, False, 12),
+                ("1-7",          C_TEXT_DIM, False, 12),
+                ("Setas",        C_TEXT_DIM, False, 12),
+                ("BACKSPACE",    C_TEXT_DIM, False, 12),
+                ("TAB",          C_TEXT_DIM, False, 12),
+                ("R",            C_TEXT_DIM, False, 12),
+                ("ESC",          C_TEXT_DIM, False, 12),
+            ]
+            vals = [
+                ("",                 C_ACCENT2,  True,  14),
+                ("ajustar valor",    C_TEXT,     False, 12),
+                ("eixo Z / fino",    C_TEXT,     False, 12),
+                ("selecionar transf",C_TEXT,     False, 12),
+                ("girar câmera",     C_TEXT,     False, 12),
+                ("resetar transf",   C_TEXT,     False, 12),
+                ("modo auto",        C_TEXT,     False, 12),
+                ("resetar câmera",   C_TEXT,     False, 12),
+                ("menu",             C_TEXT,     False, 12),
+            ]
+        else:
+            ctrl = [
+                ("CONTROLES",  C_ACCENT,   True,  14),
+                ("W/S",        C_TEXT_DIM, False, 12),
+                ("A/D",        C_TEXT_DIM, False, 12),
+                ("Q/E",        C_TEXT_DIM, False, 12),
+                ("Setas",      C_TEXT_DIM, False, 12),
+                ("Z/X",        C_TEXT_DIM, False, 12),
+                ("R",          C_TEXT_DIM, False, 12),
+                ("TAB",        C_TEXT_DIM, False, 12),
+                ("ESC",        C_TEXT_DIM, False, 12),
+            ]
+            vals = [
+                ("",              C_ACCENT,   True,  14),
+                ("frente / trás", C_TEXT,     False, 12),
+                ("esq / dir",     C_TEXT,     False, 12),
+                ("baixo / cima",  C_TEXT,     False, 12),
+                ("girar câmera",  C_TEXT,     False, 12),
+                ("zoom",          C_TEXT,     False, 12),
+                ("resetar",       C_TEXT,     False, 12),
+                ("modo manual",   C_TEXT,     False, 12),
+                ("menu",          C_TEXT,     False, 12),
+            ]
         rect_aa(surf, C_PANEL_DK, cx-10, 10, 200, 210, raio=10)
         rect_aa(surf, (0,0,0,0),  cx-10, 10, 200, 210, raio=10, borda=1, cor_borda=C_BORDER)
 
@@ -874,7 +1043,7 @@ class Visualizador:
             texto(surf, v, cx+72,  cy2, vc, "Consolas", vs)
             cy2 += ks + 5
 
-        # ── Câmera info ─────────────────────────────────────────────────────
+        # ── Câmera info ──────────────────────────────────────────────────
         cy3 = 230
         rect_aa(surf, C_PANEL_DK, cx-10, cy3, 200, 75, raio=10)
         rect_aa(surf, (0,0,0,0),  cx-10, cy3, 200, 75, raio=10, borda=1, cor_borda=C_BORDER)
@@ -885,14 +1054,94 @@ class Visualizador:
         texto(surf, f"Yaw  {math.degrees(cam.yaw):.0f}°   Pitch {math.degrees(cam.pitch):.0f}°",
               cx, cy3+56, C_TEXT_DIM, "Consolas", 10)
 
-        # ── Badge ESC ──────────────────────────────────────────────────────
-        rect_aa(surf, C_PANEL_MD, self.larg//2-80, self.alt-36, 160, 26, raio=8)
-        texto(surf, "ESC -> voltar ao menu",
-              self.larg//2, self.alt-29, C_TEXT_DIM, "Consolas", 12, centro=True)
+        # ── Badge rodapé ──────────────────────────────────────────────────
+        bw2 = 260 if self._modo_manual else 160
+        rect_aa(surf, C_PANEL_MD, self.larg//2-bw2//2, self.alt-36, bw2, 26, raio=8)
+        if self._modo_manual:
+            texto(surf, "TAB -> auto  |  BACKSPACE -> reset  |  ESC -> menu",
+                  self.larg//2, self.alt-29, C_TEXT_DIM, "Consolas", 10, centro=True)
+        else:
+            texto(surf, "TAB -> modo manual  |  ESC -> menu",
+                  self.larg//2, self.alt-29, C_TEXT_DIM, "Consolas", 11, centro=True)
 
-        if self._pausado:
+        if self._pausado and not self._modo_manual:
             texto(surf, "||  PAUSADO", self.larg//2, self.alt//2 - 20,
                   C_ACCENT, "Consolas", 22, bold=True, centro=True)
+
+    # ── HUD do Modo Manual: cards de transformações clicáveis ──────────
+
+    _TRANSF_NOMES = [
+        (1, "Translação",    "TX TY TZ"),
+        (2, "Escala",        "uniforme"),
+        (3, "Rotação X",     "Euler"),
+        (4, "Rotação Y",     "Euler"),
+        (5, "Rotação Z",     "Euler"),
+        (6, "SLERP",         "quaternion"),
+        (7, "Cisalhamento",  "shear XY"),
+    ]
+
+    def _draw_hud_manual(self):
+        """Desenha o painel lateral de transformações clicáveis."""
+        surf = self.surf
+        self._hud_cards = []
+
+        card_x, card_w, card_h, gap = 10, 280, 34, 4
+        start_y = 186
+
+        for idx, (tid, nome, dica) in enumerate(self._TRANSF_NOMES):
+            cy = start_y + idx * (card_h + gap)
+            ativo = (tid == self._transf_ativa)
+            rect = pygame.Rect(card_x, cy, card_w, card_h)
+            self._hud_cards.append((rect, tid))
+
+            # Fundo do card
+            if ativo:
+                cor_bg = lerp_color(C_PANEL_MD, C_ACCENT2, 0.18)
+                cor_bd = C_ACCENT2
+            else:
+                cor_bg = C_PANEL_DK
+                cor_bd = C_BORDER
+
+            rect_aa(surf, cor_bg, card_x, cy, card_w, card_h, raio=8)
+            rect_aa(surf, (0,0,0,0), card_x, cy, card_w, card_h,
+                    raio=8, borda=1 if not ativo else 2, cor_borda=cor_bd)
+
+            # Indicador lateral
+            if ativo:
+                pygame.draw.rect(surf, C_ACCENT2,
+                                 (card_x, cy+6, 3, card_h-12), border_radius=2)
+
+            # Número + Nome
+            num_cor = C_ACCENT2 if ativo else C_TEXT_DIM
+            nome_cor = C_WHITE if ativo else C_TEXT
+            texto(surf, str(tid), card_x + 14, cy + 5, num_cor, "Consolas", 11, bold=True)
+            texto(surf, nome, card_x + 32, cy + 5, nome_cor, "Consolas", 13, bold=ativo)
+
+            # Valor atual
+            val_str = self._valor_transf_str(tid)
+            texto(surf, val_str, card_x + 32, cy + 20, C_TEXT_DIM, "Consolas", 10)
+
+            # Dica à direita
+            texto(surf, dica, card_x + card_w - 10, cy + 10,
+                  C_TEXT_DIM, "Consolas", 9, centro=False)
+
+    def _valor_transf_str(self, tid):
+        """Retorna string formatada com o valor atual da transformação."""
+        if tid == 1:
+            return f"({self._manual_tx:+.2f}, {self._manual_ty:+.2f}, {self._manual_tz:+.2f})"
+        elif tid == 2:
+            return f"{self._manual_esc:.2f}x"
+        elif tid == 3:
+            return f"{math.degrees(self._manual_rx):+.1f}°"
+        elif tid == 4:
+            return f"{math.degrees(self._manual_ry):+.1f}°"
+        elif tid == 5:
+            return f"{math.degrees(self._manual_rz):+.1f}°"
+        elif tid == 6:
+            return f"t = {self._manual_slerp_t:.3f}"
+        elif tid == 7:
+            return f"a={self._manual_shear_a:+.2f}  b={self._manual_shear_b:+.2f}"
+        return ""
 
 
 # ════════════════════════════════════════════════════════════════════════════
